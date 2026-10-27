@@ -9,7 +9,6 @@
     "generation_commit": "9cbaac21abf64de1745c20b54af718f565b35324",
     "original_results_documentation_commit": "5be819140ebcbb0ed56bdf4c4c2c3b23468d5730",
     "baseline_branch": "codex/baseline-joint-429-512-20261027",
-    "generation_commit_scope": "Original local experiment provenance; GitHub connector publication has a separate snapshot commit identity.",
     "generation_runtime_files_sha256": {
       "scripts/reconstruct_joint_scene.py": "9450754853a33a7711e185921aa3ed16f86e9c302db8132be8bfb045b115f861",
       "scripts/joint_scene_inputs.py": "ebdf6f98d122f3bfd628a5036ad6c4b58d2a6a1aba40e80a42cd503ba0a3041c",
@@ -22,7 +21,8 @@
       "genrecon/modules/cond_3D/aggregation_net.py": "1b244a3e994da775421ef9ff032757fbb7e6785f5a045a2ef38c585c90d9ef7e",
       "genrecon/pipelines/joint_decode.py": "72c79e5066a50b2518c2d8bd666e14f3ada41200f3810384c3c5cc3cc6ba0aa6",
       "genrecon/pipelines/lattice_mesh_merge.py": "13c15f5d5d662415576ce1a6d74589d58c85ee90dc1406f6c911dad443c6a5a4"
-    }
+    },
+    "tag": "baseline-joint-429-512-20261027"
   },
   "runtime_entrypoint": "scripts/reconstruct_joint_scene.py",
   "artifact_root": "/kiri/output/scene_reconstruction/genrecon_joint_429_20261027",
