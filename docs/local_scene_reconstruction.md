@@ -38,6 +38,11 @@ python scripts/fuse_local_meshes.py \
 python scripts/inspect_ffba_large_result.py \
   --result-dir RUN/fusion --data-dir SCENE \
   --source-dataset ORIGINAL_FFBA_SCENE --output RUN/inspection --threads 4
+
+# Optional derived initializer; keep the complete fusion for quality checks.
+python scripts/run_profiled.py --output RUN/coarse_profile -- \
+  timeout 240s python scripts/simplify_geometry.py \
+  --mesh RUN/fusion/mesh.ply --output RUN/coarse --target-faces 2000000
 ```
 
 Fusion assigns each fixed triangle barycenter to the nearest **covering** chunk
@@ -51,3 +56,15 @@ restricted to their common spatial volume. It reports depth and unsigned-normal
 disagreement and possible double surfaces. This measures local consistency,
 not ground-truth reconstruction accuracy. The final inspector also preserves
 all triangles when applying the inverse FFBA world transform.
+
+Audit cameras are ranked by rays intersecting the overlap volume, then a bounded
+low-resolution raw-mesh probe selects views with visible common surfaces and
+different poses. Depth/normal error values do not influence this selection.
+Empty probes, full-resolution common-pixel counts and every candidate score are
+retained in the audit report. Missing or outside-overlap hits are excluded from
+common-depth statistics; these statistics alone cannot establish seam quality.
+
+`simplify_geometry.py` optionally applies CuMesh QEM to the completed fusion in
+a separate GPU process, exporting a smaller geometry-only PLY. It preserves the
+complete source and does not fix local seam disagreements. CuMesh CUDA memory
+is measured by the device profiler, since it is allocated outside PyTorch.

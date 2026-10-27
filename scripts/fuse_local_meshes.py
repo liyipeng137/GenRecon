@@ -371,6 +371,118 @@ def groups_spatially_overlap(a, b, chunks):
                for x in ca for y in cb)
 
 
+def overlap_boxes(a, b, chunks):
+    """Positive-volume intersections of the two context cube unions."""
+    left = [c for c in chunks if c["id"] in a["chunk_ids"]]
+    right = [c for c in chunks if c["id"] in b["chunk_ids"]]
+    boxes = []
+    for x in left:
+        for y in right:
+            lo = np.maximum(x["center"] - x["size"] / 2, y["center"] - y["size"] / 2)
+            hi = np.minimum(x["center"] + x["size"] / 2, y["center"] + y["size"] / 2)
+            if np.all(lo < hi):
+                boxes.append((lo, hi))
+    return boxes
+
+
+def camera_overlap_volume_score(image, camera, boxes, width=64):
+    """Cheap camera-ray/overlap-volume score, independent of mesh agreement."""
+    width = min(width, camera["width"])
+    height = max(1, int(round(camera["height"] * width / camera["width"])))
+    K = np.diag([width / camera["width"], height / camera["height"], 1.]) @ camera["K"]
+    yy, xx = np.meshgrid(np.arange(height) + .5, np.arange(width) + .5, indexing="ij")
+    directions = np.stack([(xx - K[0, 2]) / K[0, 0], (yy - K[1, 2]) / K[1, 1], np.ones_like(xx)], -1)
+    directions = directions.reshape(-1, 3) @ image["R"]
+    center = -image["R"].T @ image["tvec"]
+    parallel = np.abs(directions) < 1e-12
+    safe = np.where(parallel, 1., directions)
+    covered = np.zeros(len(directions), dtype=bool)
+    for lo, hi in boxes:
+        ta, tb = (lo - center) / safe, (hi - center) / safe
+        near = np.max(np.where(parallel, -np.inf, np.minimum(ta, tb)), axis=1)
+        far = np.min(np.where(parallel, np.inf, np.maximum(ta, tb)), axis=1)
+        outside_parallel = np.any(parallel & ((center < lo) | (center >= hi)), axis=1)
+        covered |= (near < far) & (far > 0) & ~outside_parallel
+    return dict(volume_ray_fraction=float(covered.mean()), volume_hit_rays=int(covered.sum()),
+                volume_total_rays=len(covered))
+
+
+def pair_overlap_masks(views, image, chunks, a, b):
+    masks = []
+    for view in views:
+        points = hit_points(view, image).reshape(-1, 3)
+        mask = inside_chunks(points, chunks, a["chunk_ids"]) & inside_chunks(points, chunks, b["chunk_ids"])
+        masks.append(mask.reshape(view["valid"].shape))
+    return masks
+
+
+def select_shared_views(names, image_by_name, cameras, a, b, chunks, sa, sb, mapper,
+                        max_views=3, width=320, threads=4):
+    """Choose visible overlap evidence without looking at depth/normal error.
+
+    Probe a bounded candidate pool using the already needed raw-mesh scenes.
+    An overlap volume can surround the camera while containing no visible
+    generated surface, so the coarse score alone cannot reject empty views.
+    """
+    boxes = overlap_boxes(a, b, chunks)
+    ranked = []
+    for name in sorted(names):
+        image = image_by_name[name]
+        ranked.append(dict(image=name, **camera_overlap_volume_score(image, cameras[image["camera_id"]], boxes)))
+    ranked.sort(key=lambda row: (-row["volume_ray_fraction"], row["image"]))
+    candidate_count = min(len(ranked), max(12, 4 * max_views))
+    probes = []
+    probe_width = min(80, width)
+    for row in ranked[:candidate_count]:
+        image = image_by_name[row["image"]]
+        camera = cameras[image["camera_id"]]
+        va, vb = mapper.cast_view(sa, image, camera, probe_width, threads), mapper.cast_view(sb, image, camera, probe_width, threads)
+        ma, mb = pair_overlap_masks((va, vb), image, chunks, a, b)
+        common = va["valid"] & vb["valid"] & ma & mb
+        probes.append(dict(row, common_hit_pixels=int(common.sum()), probe_pixels=int(common.size),
+                           left_hit_pixels=int(va["valid"].sum()), right_hit_pixels=int(vb["valid"].sum())))
+    nonempty = [r for r in probes if r["common_hit_pixels"] > 0]
+    chosen = []
+    threshold = None
+    if nonempty:
+        maximum = max(r["common_hit_pixels"] for r in nonempty)
+        threshold = min(maximum, max(16, .15 * maximum))
+        pool = [r for r in nonempty if r["common_hit_pixels"] >= threshold]
+        if len(pool) < max_views:
+            pool = nonempty
+        first = max(pool, key=lambda r: r["common_hit_pixels"])
+        chosen = [first]
+        side = float(np.mean([c["size"].mean() for c in chunks if c["id"] in set(a["chunk_ids"]) | set(b["chunk_ids"])]))
+        def utility(row):
+            image = image_by_name[row["image"]]
+            center = -image["R"].T @ image["tvec"]
+            nearest = np.inf
+            for selected in chosen:
+                other = image_by_name[selected["image"]]
+                oc = -other["R"].T @ other["tvec"]
+                distance = np.linalg.norm(center - oc) / side
+                angle = np.arccos(np.clip(image["R"][2] @ other["R"][2], -1, 1)) / np.pi
+                nearest = min(nearest, distance + angle)
+            return (row["common_hit_pixels"] / maximum) * (.25 + nearest), row["common_hit_pixels"]
+        while len(chosen) < min(max_views, len(pool)):
+            remaining = [r for r in pool if r["image"] not in {s["image"] for s in chosen}]
+            chosen.append(max(remaining, key=utility))
+        status = "nonempty_overlap_views" if len(chosen) == max_views else "fewer_nonempty_views_than_requested"
+    else:
+        # Retain a few explicitly labelled empty views as visual diagnostics.
+        chosen = probes[:max_views]
+        status = "no_common_surface_in_probed_views"
+    record = dict(method="64px overlap-volume ray ranking; bounded 80px raw-surface probe; coverage and pose diversity",
+                  status=status, requested_views=max_views, coarse_ranked_views=ranked,
+                  probe_width=probe_width, candidate_limit=max(12, 4 * max_views), probed_views=probes,
+                  strong_common_hit_threshold=threshold,
+                  empty_probe_views=[r["image"] for r in probes if not r["common_hit_pixels"]],
+                  chosen_views=[dict(image=r["image"], common_hit_pixels_at_probe=r["common_hit_pixels"]) for r in chosen],
+                  selected_empty_probe_views=[r["image"] for r in chosen if not r["common_hit_pixels"]],
+                  error_metrics_used_for_selection=False)
+    return [r["image"] for r in chosen], record
+
+
 def overlap_audit(manifest, output, mapper, width=320, max_views=3, threads=4):
     from PIL import Image, ImageDraw
     generic = import_helper("inspect_ffba_result")
@@ -386,25 +498,22 @@ def overlap_audit(manifest, output, mapper, width=320, max_views=3, threads=4):
             if not names:
                 reports.append(dict(groups=[a["id"], b["id"]], status="no_shared_input_camera"))
                 continue
-            chosen = [names[i] for i in np.unique(np.linspace(0, len(names) - 1, min(max_views, len(names))).round().astype(int))]
             pa, pb = a.get("context_mesh_path", a["mesh_path"]), b.get("context_mesh_path", b["mesh_path"])
             if ((a.get("mesh_is_core_owned") and "context_mesh_path" not in a) or
                     (b.get("mesh_is_core_owned") and "context_mesh_path" not in b)):
                 reports.append(dict(groups=[a["id"], b["id"]], status="context_mesh_missing_for_core_owned_mesh", shared_cameras=len(names)))
                 continue
             sa, sb = make_scene(pa, mapper, threads), make_scene(pb, mapper, threads)
-            pair = dict(groups=[a["id"], b["id"]], status="ok", shared_cameras=len(names), views=[])
+            chosen, selection = select_shared_views(names, image_by_name, cameras, a, b, chunks, sa, sb, mapper,
+                                                    max_views=max_views, width=width, threads=threads)
+            pair = dict(groups=[a["id"], b["id"]], status="ok", shared_cameras=len(names), views=[], view_selection=selection)
             pair_output = output / f"{a['id']}__{b['id']}"
             pair_output.mkdir()
             for name in chosen:
                 image = image_by_name[name]
                 cam = cameras[image["camera_id"]]
                 va, vb = mapper.cast_view(sa, image, cam, width, threads), mapper.cast_view(sb, image, cam, width, threads)
-                masks = []
-                for view in (va, vb):
-                    points = hit_points(view, image).reshape(-1, 3)
-                    mask = inside_chunks(points, chunks, a["chunk_ids"]) & inside_chunks(points, chunks, b["chunk_ids"])
-                    masks.append(mask.reshape(view["valid"].shape))
+                masks = pair_overlap_masks((va, vb), image, chunks, a, b)
                 metrics, common, relative, angles = compare_raycast_hits(va, vb, *masks)
                 pair["views"].append(dict(image=name, **metrics))
                 stem = Path(name).stem
@@ -424,6 +533,8 @@ def overlap_audit(manifest, output, mapper, width=320, max_views=3, threads=4):
                 draw.text((5, 20), name, fill="#aaccff")
                 row.save(pair_output / (stem + ".jpg"), quality=90)
                 previews.append(row)
+            pair["view_selection"]["full_resolution_empty_views"] = [r["image"] for r in pair["views"] if not r["common_overlap_pixels"]]
+            pair["view_selection"]["full_resolution_common_pixels"] = {r["image"]:r["common_overlap_pixels"] for r in pair["views"]}
             reports.append(pair)
             del sa, sb
             gc.collect()
@@ -443,7 +554,8 @@ def overlap_audit(manifest, output, mapper, width=320, max_views=3, threads=4):
         "relative_depth": "abs(z_left-z_right)/min(z_left,z_right), COLMAP camera-Z",
         "normal_angle": "Unsigned angle; opposite winding is treated as equivalent",
         "parallel_depth_disagreement_candidate": "Relative depth difference >2% and unsigned normals <15 degrees; a possible duplicate sheet, not proof",
-        "limitations": "No ground truth, visibility equivalence, watertightness or mesh accuracy claim; occlusion and different surfaces can also disagree"})
+        "view_selection": "Selects by visible common surface area and pose diversity; depth and normal disagreement values are never used to select views",
+        "limitations": "No ground truth, visibility equivalence, watertightness or mesh accuracy claim; occlusion and different surfaces can also disagree. Common-depth metrics exclude missing/outside-overlap hits; inspect counts and final fused mesh too."})
 
 
 def main():

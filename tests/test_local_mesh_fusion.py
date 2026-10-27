@@ -142,5 +142,60 @@ class AuditTests(unittest.TestCase):
             self.assertTrue((base / "fusion/mesh_raw_union.ply").is_file())
 
 
+class SharedViewSelectionTests(unittest.TestCase):
+    def make_fixture(self, empty_names):
+        images = {}
+        for i, name in enumerate(("a.png", "b.png", "c.png", "d.png")):
+            images[name] = dict(name=name, R=np.eye(3), tvec=np.array([-.1 * i, 0., 0.]), camera_id=1)
+        K = np.array([[100., 0, 2.], [0, 100., 2.], [0, 0, 1.]])
+        cameras = {1: dict(width=4, height=4, K=K)}
+        calls = []
+        class Mapper:
+            @staticmethod
+            def cast_view(scene, image, camera, width, threads):
+                calls.append((scene, image["name"], width))
+                depth = 2.2 if scene == "right" and image["name"] == "d.png" else 2.
+                return dict(depth=np.full((4, 4), depth), valid=np.full((4, 4), image["name"] not in empty_names), K=K)
+        return images, cameras, Mapper, calls
+
+    def test_coarse_volume_rejects_rays_pointing_away(self):
+        image = dict(R=np.eye(3), tvec=np.zeros(3))
+        camera = dict(width=8, height=8, K=np.array([[20., 0, 4.], [0, 20., 4.], [0, 0, 1.]]))
+        boxes = [(np.array([-1., -1., 1.]), np.array([1., 1., 3.]))]
+        self.assertEqual(MOD.camera_overlap_volume_score(image, camera, boxes)["volume_ray_fraction"], 1.)
+        image["R"] = np.diag([1., -1., -1.])
+        self.assertEqual(MOD.camera_overlap_volume_score(image, camera, boxes)["volume_ray_fraction"], 0.)
+
+    def test_mesh_probe_removes_empty_views_and_ignores_error_for_selection(self):
+        images, cameras, mapper, calls = self.make_fixture({"b.png"})
+        chosen, report = MOD.select_shared_views(list(reversed(images)), images, cameras,
+            dict(chunk_ids=[0]), dict(chunk_ids=[1]), chunks(), "left", "right", mapper,
+            max_views=3, width=320, threads=2)
+        self.assertEqual(set(chosen), {"a.png", "c.png", "d.png"})
+        self.assertEqual(report["empty_probe_views"], ["b.png"])
+        self.assertEqual(report["selected_empty_probe_views"], [])
+        self.assertFalse(report["error_metrics_used_for_selection"])
+        self.assertEqual(len(report["coarse_ranked_views"]), 4)
+        self.assertEqual(len(report["probed_views"]), 4)
+        self.assertEqual({c[2] for c in calls}, {80})
+        self.assertTrue(all(r["common_hit_pixels_at_probe"] == 16 for r in report["chosen_views"]))
+
+    def test_fewer_valid_views_returns_only_nonempty_evidence(self):
+        images, cameras, mapper, _ = self.make_fixture({"b.png", "c.png", "d.png"})
+        chosen, report = MOD.select_shared_views(list(images), images, cameras,
+            dict(chunk_ids=[0]), dict(chunk_ids=[1]), chunks(), "left", "right", mapper, max_views=3)
+        self.assertEqual(chosen, ["a.png"])
+        self.assertEqual(report["status"], "fewer_nonempty_views_than_requested")
+
+    def test_all_empty_views_are_explicit_diagnostics_and_deterministic(self):
+        images, cameras, mapper, _ = self.make_fixture({"a.png", "b.png", "c.png", "d.png"})
+        args = (images, cameras, dict(chunk_ids=[0]), dict(chunk_ids=[1]), chunks(), "left", "right", mapper)
+        chosen, report = MOD.select_shared_views(list(images), *args, max_views=3)
+        again, _ = MOD.select_shared_views(list(reversed(images)), *args, max_views=3)
+        self.assertEqual(chosen, again)
+        self.assertEqual(report["status"], "no_common_surface_in_probed_views")
+        self.assertEqual(len(report["selected_empty_probe_views"]), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
