@@ -21,7 +21,7 @@ cd "$REPO_ROOT"
   --ss_ckpt "$GENRECON_WEIGHTS/sparse_structure.pt" \
   --shape_ckpt "$GENRECON_WEIGHTS/shape_slat.pt" \
   --tex_ckpt "$GENRECON_WEIGHTS/texture_slat.pt" \
-  --num_imgs_per_scene 60 --pipeline 512 --pipeline_config configs/pipelines/texture.json \
+  --num_imgs_per_scene 60 --view_selection uniform --pipeline 512 --pipeline_config configs/pipelines/texture.json \
   --colmap_subdir colmap --skip_point_cleaning --min_points_per_chunk 100 \
   --chunk_size_factor 1.11 --image_batch_size 2 --proj_batch_voxels 1024 \
   --joint_decode_max_chunks_per_group 1 --joint_decode_max_inflated_voxels 20000 \

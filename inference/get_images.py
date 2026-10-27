@@ -11,6 +11,7 @@ from PIL import Image
 
 from genrecon.datasets.components import chunk_visible_in_camera
 from genrecon.pipelines.types import SelectedImages
+from inference.view_selection import chunk_projection_areas, coverage_report, select_pose_coverage
 
 # ScanNet++ Nerfstudio DSLR poses are stored in a world frame that differs from
 # the aligned scan mesh frame. Empirically, camera centres map as:
@@ -35,7 +36,58 @@ def _to_chunk0_extrinsics(c2w_world: torch.Tensor, m_o2c_0: torch.Tensor) -> tor
     return _FLIP_Y_Z @ torch.linalg.inv(m_o2c_0 @ c2w_world)
 
 
+def _processed_crop_geometry(intrinsics, width, height, crop_box=None):
+    """K and crop used by loading, also reused for selection visibility."""
+    intr = intrinsics.clone()
+    if crop_box is not None or width == height:
+        return intr, crop_box
+    cx_px, cy_px = float(intr[0, 2]) * width, float(intr[1, 2]) * height
+    size = int(2 * min(cx_px, width - cx_px, cy_px, height - cy_px))
+    if size < 1:
+        raise ValueError("Principal point does not permit a nonempty square crop")
+    left = max(0, min(int(round(cx_px - .5 * size)), width - size))
+    top = max(0, min(int(round(cy_px - .5 * size)), height - size))
+    intr[0, 0] *= width / size
+    intr[1, 1] *= height / size
+    intr[0, 2] = (intr[0, 2] * width - left) / size
+    intr[1, 2] = (intr[1, 2] * height - top) / size
+    return intr, (left, top, size)
+
+
 class BaseImageSelecter:
+    def __init__(self, view_selection="pose_coverage", pose_position_threshold=.05,
+                 pose_rotation_threshold=10., min_views_per_chunk=3):
+        if view_selection not in ("uniform", "pose_coverage"):
+            raise ValueError("view_selection must be uniform or pose_coverage")
+        if not np.isfinite(pose_position_threshold) or pose_position_threshold <= 0:
+            raise ValueError("pose_position_threshold must be finite and positive")
+        if not np.isfinite(pose_rotation_threshold) or not 0 < pose_rotation_threshold <= 180:
+            raise ValueError("pose_rotation_threshold must be in (0,180]")
+        if isinstance(min_views_per_chunk, bool) or not isinstance(min_views_per_chunk, int) or min_views_per_chunk < 1:
+            raise ValueError("min_views_per_chunk must be a positive integer")
+        self.view_selection = view_selection
+        self.pose_position_threshold = pose_position_threshold
+        self.pose_rotation_threshold = pose_rotation_threshold
+        self.min_views_per_chunk = min_views_per_chunk
+
+    def _camera_chunk_areas(self, cameras, transforms):
+        """Max area over a raw image's actual crops; never deduplicate crops."""
+        tagged = [{**cam, "_selection_parent": i} for i, cam in enumerate(cameras)]
+        views = self._prepare_scene_pool(tagged)
+        intrinsics = []
+        for view in views:
+            with Image.open(view["img_path"]) as image:
+                intr, _ = _processed_crop_geometry(view["intrinsics"], *image.size,
+                                                   view.get("crop_box"))
+            intrinsics.append(intr.cpu().numpy())
+        chunks = np.stack([t.cpu().numpy() for t in transforms]) if transforms else np.empty((0, 4, 4))
+        projected = chunk_projection_areas(
+            np.stack([v["c2w_blender"].cpu().numpy() for v in views]),
+            np.stack(intrinsics), chunks)
+        areas = np.zeros((len(cameras), len(chunks)), dtype=np.float64)
+        np.maximum.at(areas, [v["_selection_parent"] for v in views], projected)
+        return areas
+
     def _prepare_scene_pool(self, scene_picks_raw: list[dict]) -> list[dict]:
         """Hook for subclasses that want to expand the scene pool before image
         loading (e.g. iPhone two-crop). Default is identity — non-iPhone
@@ -77,27 +129,11 @@ class BaseImageSelecter:
         for i, (img_path, intr) in enumerate(zip(img_paths, intrinsics)):
             image = Image.open(img_path)
             W, H = image.size
-            intr = intr.clone()
-
             crop_box = crop_boxes[i] if crop_boxes is not None else None
+            intr, crop_box = _processed_crop_geometry(intr, W, H, crop_box)
             if crop_box is not None:
-                # Crop box was pre-computed (and intrinsics already adjusted) by
-                # the caller — just apply it.
-                left, top, S = crop_box
-                image = image.crop((left, top, left + S, top + S))
-            elif W != H:
-                # Legacy center-crop-around-principal-point path.
-                cx_px = float(intr[0, 2]) * W
-                cy_px = float(intr[1, 2]) * H
-                max_half = min(cx_px, W - cx_px, cy_px, H - cy_px)
-                crop_size = int(2 * max_half)
-                left = max(0, min(int(round(cx_px - 0.5 * crop_size)), W - crop_size))
-                top = max(0, min(int(round(cy_px - 0.5 * crop_size)), H - crop_size))
-                image = image.crop((left, top, left + crop_size, top + crop_size))
-                intr[0, 0] = intr[0, 0] * (W / crop_size)
-                intr[1, 1] = intr[1, 1] * (H / crop_size)
-                intr[0, 2] = (intr[0, 2] * W - left) / crop_size
-                intr[1, 2] = (intr[1, 2] * H - top) / crop_size
+                left, top, size = crop_box
+                image = image.crop((left, top, left + size, top + size))
 
             if "A" in image.getbands():
                 alpha = torch.tensor(np.array(image.getchannel("A"))).float() / 255.0
@@ -174,37 +210,58 @@ class BaseImageSelecter:
         rng: random.Random,
         m_original_to_chunk: list[torch.Tensor] | None = None,
     ) -> list[dict]:
-        """Evenly-spaced subset of all cameras (or all of them when fewer than the cap).
+        """Select original frames before crop expansion, retaining the hard cap.
 
-        Picks `num_imgs_per_scene` indices via np.linspace over the camera list,
-        which assumes the cameras come in capture order and gives uniform
-        coverage across the trajectory.
-
-        When ``m_original_to_chunk`` is given, filters first to cameras visible
-        from at least one chunk. This matters for low-N runs (e.g. N=1) where
-        a midpoint linspace pick may land on a camera that sees no kept chunk
-        and would force every chunk to be dropped — particularly in the
-        single-chunk ablation case.
-
-        Returns the raw camera dicts (with ``c2w_blender``) so callers can both
-        compute scene-wide ``extrinsics_c0`` *and* reuse this restricted pool
-        for the per-chunk 2D-cond pick.
+        Pose selection uses actual crop-frustum coverage. The uniform branch
+        preserves the historical original-camera filtering and linspace picks.
+        Both report coverage in the actual processed crop geometry.
         """
-        if m_original_to_chunk is not None:
-            visible = []
-            for cam in cameras:
-                for m_o2c_i in m_original_to_chunk:
-                    ext_i = _FLIP_Y_Z @ torch.linalg.inv(m_o2c_i @ cam["c2w_blender"])
-                    if self._check_acceptance(ext_i, cam["intrinsics"]):
-                        visible.append(cam)
-                        break
-            if not visible:
-                print("[get_images] no camera visible from any chunk; " "falling back to unfiltered pool.")
+        if isinstance(num_imgs_per_scene, bool) or not isinstance(num_imgs_per_scene, int) or num_imgs_per_scene < 1:
+            raise ValueError("num_imgs_per_scene must be a positive integer")
+        if not cameras:
+            raise ValueError("No cameras remain after loading/exclusion")
+        transforms = list(m_original_to_chunk or [])
+        areas = self._camera_chunk_areas(cameras, transforms)
+        if self.view_selection == "uniform":
+            candidate_ids = []
+            for i, cam in enumerate(cameras):
+                if not transforms or any(self._check_acceptance(
+                    _FLIP_Y_Z @ torch.linalg.inv(t @ cam["c2w_blender"]), cam["intrinsics"])
+                    for t in transforms):
+                    candidate_ids.append(i)
+            fallback = not candidate_ids
+            if fallback:
+                candidate_ids = list(range(len(cameras)))
+            if len(candidate_ids) > num_imgs_per_scene:
+                offsets = np.linspace(0, len(candidate_ids) - 1, num_imgs_per_scene).round().astype(int)
+                indices = [candidate_ids[i] for i in offsets]
             else:
-                cameras = visible
-        if len(cameras) <= num_imgs_per_scene:
-            return list(cameras)
-        indices = np.linspace(0, len(cameras) - 1, num_imgs_per_scene).round().astype(int).tolist()
+                indices = candidate_ids
+            report = coverage_report(areas, indices, min_views_per_chunk=self.min_views_per_chunk)
+            report.update(strategy="uniform", input_camera_count=len(cameras),
+                          candidate_camera_count=len(candidate_ids),
+                          budget_original_images=num_imgs_per_scene,
+                          selected_original_images=len(indices), selected_indices=indices,
+                          all_invisible_fallback=fallback)
+        else:
+            poses = np.stack([c["c2w_blender"].cpu().numpy() for c in cameras])
+            intrinsics = np.stack([c["intrinsics"].cpu().numpy() for c in cameras])
+            if transforms:
+                scales = [abs(np.linalg.det(t[:3, :3].double().cpu().numpy())) ** (-1. / 3.)
+                          for t in transforms]
+                scale = float(np.median(scales))
+            else:
+                scale = max(float(np.linalg.norm(np.ptp(poses[:, :3, 3], axis=0))), 1e-8)
+            indices, report = select_pose_coverage(
+                poses, intrinsics, areas, num_imgs_per_scene, position_scale=scale,
+                position_threshold=self.pose_position_threshold,
+                rotation_threshold_degrees=self.pose_rotation_threshold,
+                min_views_per_chunk=self.min_views_per_chunk)
+            report["position_scale_source"] = "median_chunk_side" if transforms else "camera_span"
+        report["selected_image_paths"] = [cameras[i]["img_path"] for i in indices]
+        self._selection_report = report
+        print(f"[view_selection] {self.view_selection}: {len(cameras)} originals -> {len(indices)}; "
+              f"uncovered chunks={report['uncovered_chunk_indices']}", flush=True)
         return [cameras[i] for i in indices]
 
     def get_images(
@@ -264,6 +321,15 @@ class BaseImageSelecter:
         # center_crop=False. Cond2d picking then runs against this expanded
         # pool so visibility chooses the better-fitting crop per chunk.
         scene_picks_raw = self._prepare_scene_pool(scene_picks_raw)
+        # Make legacy principal-point centre crops explicit too, so the 2D
+        # anchor visibility check sees exactly the K used by image loading.
+        processed_pool = []
+        for cam in scene_picks_raw:
+            with Image.open(cam["img_path"]) as image:
+                intr, box = _processed_crop_geometry(cam["intrinsics"], *image.size,
+                                                     cam.get("crop_box"))
+            processed_pool.append({**cam, "intrinsics": intr, "crop_box": box})
+        scene_picks_raw = processed_pool
         scene_picks = [
             {
                 "img_path": cam["img_path"],
@@ -302,6 +368,20 @@ class BaseImageSelecter:
             cond2d_intr_pre,
             crop_boxes=[p.get("crop_box") for p in cond2d_picks],
         )
+
+        report = dict(self._selection_report)
+        report["selected_crop_views"] = len(scene_picks)
+        report["cond2d_selection"] = "seeded_random_actual_crop_visible_then_closest"
+        report["cond2d_views"] = []
+        crop_cameras = {(c["img_path"], c.get("crop_box")): c for c in scene_picks_raw}
+        for j, (idx, pick) in enumerate(zip(chunk_indices, cond2d_picks)):
+            camera = crop_cameras[(pick["img_path"], pick.get("crop_box"))]
+            extrinsics = _to_chunk0_extrinsics(camera["c2w_blender"], m_original_to_chunk[idx])
+            report["cond2d_views"].append({
+                "chunk_index": idx, "image_path": pick["img_path"], "crop_box": pick.get("crop_box"),
+                "frustum_visible": self._check_acceptance(extrinsics, cond2d_intr_stack[j]),
+            })
+        (out_path / "view_selection.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
 
         # ── Debug dump ───────────────────────────────────────────────────
         with (out_path / "cameras.json").open("w", encoding="utf-8") as f:
@@ -683,8 +763,8 @@ def _expand_camera_to_crops(cam: dict, center_crop: bool) -> list[dict]:
     ``crop_box=None`` so ``_process_images`` falls through to the legacy
     center-around-principal-point path.
     """
-    img = Image.open(cam["img_path"])
-    W, H = img.size
+    with Image.open(cam["img_path"]) as image:
+        W, H = image.size
     if center_crop or W == H:
         return [{**cam, "crop_box": None}]
 
@@ -729,6 +809,7 @@ class ScannetIphoneImageSelecter(_IphoneSelecterMixin, BaseImageSelecter, Scanne
         self,
         undistort_cache_dir: Path | str | None = None,
         center_crop: bool = False,
+        **selection_kwargs,
     ):
         """
         Args:
@@ -741,7 +822,7 @@ class ScannetIphoneImageSelecter(_IphoneSelecterMixin, BaseImageSelecter, Scanne
                 around the principal point. Default False → produce two square
                 crops along the longer axis for non-square frames.
         """
-        super().__init__()
+        super().__init__(**selection_kwargs)
         self.undistort_cache_dir = (
             Path(undistort_cache_dir) if undistort_cache_dir is not None else _DEFAULT_IPHONE_UNDISTORT_CACHE
         )
@@ -761,12 +842,12 @@ class IphoneMixin(ScannetIphoneMixin):
 
 
 class IphoneImageSelecter(_IphoneSelecterMixin, BaseImageSelecter, IphoneMixin):
-    def __init__(self, center_crop: bool = False):
+    def __init__(self, center_crop: bool = False, **selection_kwargs):
         """
         Args:
             center_crop: if True, fall back to the legacy single-square crop
                 around the principal point. Default False → produce two square
                 crops along the longer axis for non-square frames.
         """
-        super().__init__()
+        super().__init__(**selection_kwargs)
         self.center_crop = center_crop

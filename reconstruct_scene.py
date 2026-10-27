@@ -181,6 +181,15 @@ def build_parser() -> argparse.ArgumentParser:
         "(configs/pipelines/original.json).",
     )
     parser.add_argument("--num_imgs_per_scene", type=int, default=32)
+    parser.add_argument("--view_selection", choices=["pose_coverage", "uniform"], default="pose_coverage",
+                        help="Original-image selection: pose deduplication with chunk-frustum coverage, "
+                             "or legacy evenly spaced indices.")
+    parser.add_argument("--pose_position_threshold", type=float, default=.05,
+                        help="Near-duplicate translation threshold as a fraction of chunk side length.")
+    parser.add_argument("--pose_rotation_threshold", type=float, default=10.,
+                        help="Near-duplicate full rotation threshold in degrees (including roll).")
+    parser.add_argument("--min_views_per_chunk", type=int, default=3,
+                        help="Soft frustum-support target per chunk; image budget remains a hard cap.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--image_batch_size", type=int, default=2,
                         help="Number of independent images encoded by DINO per forward pass.")
@@ -307,11 +316,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    for name in ("image_batch_size", "proj_batch_voxels", "joint_decode_max_chunks_per_group",
+    for name in ("num_imgs_per_scene", "min_views_per_chunk", "image_batch_size", "proj_batch_voxels", "joint_decode_max_chunks_per_group",
                  "joint_decode_max_inflated_voxels", "joint_decode_overlap_r_in"):
         value = getattr(args, name)
         if value is not None and value <= 0:
             parser.error(f"--{name} must be positive")
+    if not np.isfinite(args.pose_position_threshold) or args.pose_position_threshold <= 0:
+        parser.error("--pose_position_threshold must be finite and positive")
+    if not np.isfinite(args.pose_rotation_threshold) or not 0 < args.pose_rotation_threshold <= 180:
+        parser.error("--pose_rotation_threshold must be in (0,180]")
 
     missing = [
         n
@@ -393,7 +406,10 @@ def main() -> None:
         print(f"[validation_crop] using crops/{scene_id}.json[chunks][{args.validation_crop_idx}]")
     else:
         _, m_o2c, m_c2o, rel_t = chunker_cls(**chunker_kwargs).get_chunks(scene_path, out_path)
-    selecter_kwargs: dict = {}
+    selecter_kwargs: dict = dict(view_selection=args.view_selection,
+                                pose_position_threshold=args.pose_position_threshold,
+                                pose_rotation_threshold=args.pose_rotation_threshold,
+                                min_views_per_chunk=args.min_views_per_chunk)
     if args.mode in ("Scannet_iphone", "Iphone"):
         selecter_kwargs["center_crop"] = args.center_crop
     sel = selecter_cls(**selecter_kwargs).get_images(
@@ -414,6 +430,7 @@ def main() -> None:
         "chunk_indices": list(sel.chunk_indices),
         "image_batch_size": args.image_batch_size,
         "low_vram": pipeline.low_vram,
+        "view_selection": args.view_selection,
     }
     (out_path / "selected_input_summary.json").write_text(json.dumps(selected_summary, indent=2) + "\n")
     print("Selected input:", json.dumps(selected_summary), flush=True)

@@ -180,6 +180,22 @@ python reconstruct_scene.py \
   --proj_batch_voxels 2048
 ```
 
+### Frame selection
+
+The default `--view_selection pose_coverage` selects original images before
+iPhone crop expansion. It removes near duplicates in translation, full rotation
+(including roll), and intrinsics, prioritizes uncovered chunks, then adds pose
+diversity up to `--num_imgs_per_scene`. It can return fewer images when only
+near duplicates remain. `--view_selection uniform` retains the original
+visibility-filtered, evenly spaced camera indices.
+
+The defaults are `--pose_position_threshold 0.05` (fraction of chunk side),
+`--pose_rotation_threshold 10` (degrees), and `--min_views_per_chunk 3` (a soft
+target, subject to the hard image budget). Coverage is a crop-frustum projection
+proxy without occlusion testing. `view_selection.json` records selected paths,
+crop counts, chunk support, and any coverage deficits. See
+[the implementation and validation record](docs/pose_view_selection.md).
+
 ### GLB conversion
 Bake the reconstructed scene into a single textured `scene.glb`. This reads the
 `to_glb_inputs.pt` and `chunk_inputs.pt` written by `reconstruct_scene.py` into
