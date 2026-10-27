@@ -98,3 +98,21 @@ They exercise duplicates, turning/roll, differing K, rare-coverage rescue,
 hard budgets and deficits, deterministic rigid/scale-invariant selection,
 actual crop K/visibility, legacy uniform indices/RNG compatibility, JSON output,
 and preservation of both crops after original-image selection.
+
+## Full inference integration smoke test
+
+`inference_first60_pose32/` runs the complete 512 pipeline with the existing
+first60 dataset and a 32-original-image pose-coverage budget. It selects 32
+originals / 64 crops, retains all 8 fixed chunks, and has 3–32 crop-frustum-visible
+originals per chunk. Sampling, geometry/texture decoding and saving all finish
+successfully in 202.43 seconds. The runtime commit is `6840922`, with no source
+changes during execution.
+
+The largest reported per-stage PyTorch allocated peak is 6.98 GiB. The 1-second
+device-memory samples report 5562 MiB; these samples can miss brief peaks and
+should not be substituted for the phase peak. This smoke test validates the
+new selector's integration, not mesh quality or 529-frame generation capacity.
+No additional GLB baking is needed for this check.
+
+The raw mesh and CPU geometry/FFBA-coordinate checks are kept under that run,
+along with `result/view_selection.json`, complete argv, source hashes, and logs.
