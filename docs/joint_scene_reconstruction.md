@@ -1,5 +1,8 @@
 # Joint full-scene geometry with CPU state
 
+The [429-image experiment report](joint_scene_429_results.md) records measured
+resource use, matched-view comparisons, artifacts and the remaining ceiling defects.
+
 `scripts/reconstruct_joint_scene.py` compares joint generation against the
 independent 429-image baseline without changing the layout or conditioning.
 It verifies the original 23 chunks, all 429 image hashes, 858 crop bindings,
