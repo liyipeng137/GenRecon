@@ -161,13 +161,12 @@ class ImagesTo3DPipeline(Pipeline):
             + "). Load the needed stages with ImagesTo3DPipeline.from_finetuned(...)."
         )
 
-    def _require_run_components(self, pipeline_type: str) -> None:
+    def _require_run_components(self, pipeline_type: str, geometry_only: bool = False) -> None:
         """Validate that all models and runtime assets needed for the requested pipeline path are loaded."""
         required_model_keys = [
             "sparse_structure_flow_model",
             "sparse_structure_decoder",
             "shape_slat_decoder",
-            "tex_slat_decoder",
         ]
         required_attrs = [
             "image_cond_model",
@@ -176,21 +175,23 @@ class ImagesTo3DPipeline(Pipeline):
             "shape_slat_sampler",
             "shape_slat_sampler_params",
             "shape_slat_normalization",
-            "tex_slat_sampler",
-            "tex_slat_sampler_params",
-            "tex_slat_normalization",
         ]
 
         if pipeline_type == "512":
-            required_model_keys.extend(["shape_slat_flow_model_512", "tex_slat_flow_model_512"])
+            required_model_keys.append("shape_slat_flow_model_512")
         elif pipeline_type == "1024":
-            required_model_keys.extend(["shape_slat_flow_model_1024", "tex_slat_flow_model_1024"])
+            required_model_keys.append("shape_slat_flow_model_1024")
         elif pipeline_type in {"1024_cascade", "1536_cascade"}:
             required_model_keys.extend(
-                ["shape_slat_flow_model_512", "shape_slat_flow_model_1024", "tex_slat_flow_model_1024"]
+                ["shape_slat_flow_model_512", "shape_slat_flow_model_1024"]
             )
         else:
             raise ValueError(f"Invalid pipeline type: {pipeline_type}")
+
+        if not geometry_only:
+            tex_resolution = "512" if pipeline_type == "512" else "1024"
+            required_model_keys.extend(["tex_slat_decoder", f"tex_slat_flow_model_{tex_resolution}"])
+            required_attrs.extend(["tex_slat_sampler", "tex_slat_sampler_params", "tex_slat_normalization"])
 
         self._require_components(tuple(required_model_keys), tuple(required_attrs))
 

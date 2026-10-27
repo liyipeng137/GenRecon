@@ -1,7 +1,7 @@
 """
 input:
     - sparse structure gen checkpoint
-    - shape slat and texture slat checkpoint (either both at resolution 512 or both at resolution 1024)
+    - shape slat checkpoint, and texture slat checkpoint unless --geometry_only
     - mode: Sage_gt or Scannet_gt
     - path: e.g. <PATH_TO_SAGE_TEST_SET>/renders_room/0a1be5f3 for Sage_gt and <PATH_TO_SCANNETPP_V2_OFFICIAL>/data/2a1b555966 for Scannet_gt
     - output_path
@@ -169,6 +169,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ss_ckpt", default=None)
     parser.add_argument("--shape_ckpt", default=None)
     parser.add_argument("--tex_ckpt", default=None)
+    parser.add_argument(
+        "--geometry_only", action="store_true",
+        help="Load SS + shape only and export an untextured mesh. Skip all texture inference and GLB baking inputs.",
+    )
     parser.add_argument("--ss_train_config", default=None)
     parser.add_argument("--shape_train_config", default=None)
     parser.add_argument("--tex_train_config", default=None)
@@ -326,11 +330,10 @@ def main() -> None:
     if not np.isfinite(args.pose_rotation_threshold) or not 0 < args.pose_rotation_threshold <= 180:
         parser.error("--pose_rotation_threshold must be in (0,180]")
 
-    missing = [
-        n
-        for n, v in [("--ss_ckpt", args.ss_ckpt), ("--shape_ckpt", args.shape_ckpt), ("--tex_ckpt", args.tex_ckpt)]
-        if v is None
-    ]
+    required_checkpoints = [("--ss_ckpt", args.ss_ckpt), ("--shape_ckpt", args.shape_ckpt)]
+    if not args.geometry_only:
+        required_checkpoints.append(("--tex_ckpt", args.tex_ckpt))
+    missing = [name for name, value in required_checkpoints if value is None]
     if missing:
         parser.error(f"{', '.join(missing)} required.")
 
@@ -346,18 +349,20 @@ def main() -> None:
     with (out_path / "args.json").open("w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, sort_keys=True)
 
+    stage_models = {
+        "sparse_structure_flow_model": args.ss_ckpt,
+        f"shape_slat_flow_model_{args.pipeline}": args.shape_ckpt,
+    }
+    if not args.geometry_only:
+        stage_models[f"tex_slat_flow_model_{args.pipeline}"] = args.tex_ckpt
     pipeline = FullSceneImagesTo3DPipeline.from_finetuned(
-        stage_models={
-            "sparse_structure_flow_model": args.ss_ckpt,
-            f"shape_slat_flow_model_{args.pipeline}": args.shape_ckpt,
-            f"tex_slat_flow_model_{args.pipeline}": args.tex_ckpt,
-        },
+        stage_models=stage_models,
         pipeline_config_file=args.pipeline_config,
         stage_train_configs={key: value for key, value in {
             "sparse_structure_flow_model": args.ss_train_config,
             f"shape_slat_flow_model_{args.pipeline}": args.shape_train_config,
             f"tex_slat_flow_model_{args.pipeline}": args.tex_train_config,
-        }.items() if value is not None},
+        }.items() if value is not None and key in stage_models},
     )
     pipeline.image_cond_model.batch_size = args.image_batch_size
     with (out_path / "checkpoint_load_report.json").open("w", encoding="utf-8") as f:
@@ -431,6 +436,7 @@ def main() -> None:
         "image_batch_size": args.image_batch_size,
         "low_vram": pipeline.low_vram,
         "view_selection": args.view_selection,
+        "geometry_only": args.geometry_only,
     }
     (out_path / "selected_input_summary.json").write_text(json.dumps(selected_summary, indent=2) + "\n")
     print("Selected input:", json.dumps(selected_summary), flush=True)
@@ -464,6 +470,7 @@ def main() -> None:
         joint_decode_max_chunks_per_group=args.joint_decode_max_chunks_per_group,
         joint_decode_max_inflated_voxels=args.joint_decode_max_inflated_voxels,
         joint_decode_overlap_r_in=args.joint_decode_overlap_r_in,
+        geometry_only=args.geometry_only,
     )
 
     coords_resolution = pipeline.models[f"shape_slat_flow_model_{args.pipeline}"].resolution
@@ -483,14 +490,15 @@ def main() -> None:
             coords_transform=lambda i: identity,
             label="\n PLY saved (chunk-local)!",
         )
-        _save_to_glb_inputs(
-            out_path,
-            scene_mesh,
-            vertices=scene_mesh.vertices,
-            voxel_size=scene_mesh.voxel_size,
-            origin=[scene_mesh.origin[i].item() for i in range(3)],
-            label="chunk-local ",
-        )
+        if not args.geometry_only:
+            _save_to_glb_inputs(
+                out_path,
+                scene_mesh,
+                vertices=scene_mesh.vertices,
+                voxel_size=scene_mesh.voxel_size,
+                origin=[scene_mesh.origin[i].item() for i in range(3)],
+                label="chunk-local ",
+            )
 
         # Chunk-local "world": chunk 0 sits at the origin and the cube has unit
         # side length, so chunked_to_glb.py can consume this directly. The
@@ -520,14 +528,15 @@ def main() -> None:
         )
 
         # ── Save inputs for chunked GLB conversion (testing harness) ──
-        _save_to_glb_inputs(
-            out_path,
-            scene_mesh,
-            vertices=scene_mesh.vertices * chunk_size + chunk_center0,
-            voxel_size=scene_mesh.voxel_size * chunk_size,
-            origin=[scene_mesh.origin[i].item() * chunk_size + chunk_center0[i].item() for i in range(3)],
-            label="",
-        )
+        if not args.geometry_only:
+            _save_to_glb_inputs(
+                out_path,
+                scene_mesh,
+                vertices=scene_mesh.vertices * chunk_size + chunk_center0,
+                voxel_size=scene_mesh.voxel_size * chunk_size,
+                origin=[scene_mesh.origin[i].item() * chunk_size + chunk_center0[i].item() for i in range(3)],
+                label="",
+            )
 
         chunk_inputs = {
             "chunk_centers_world": torch.stack([m_c2o[i][:3, 3] for i in sel.chunk_indices]).detach().cpu(),

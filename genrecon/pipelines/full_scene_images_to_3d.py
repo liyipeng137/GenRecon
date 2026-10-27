@@ -428,7 +428,24 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         joint_decode_max_chunks_per_group: Optional[int] = None,
         joint_decode_max_inflated_voxels: Optional[int] = None,
         joint_decode_overlap_r_in: int = 16,
-    ) -> tuple[MeshWithVoxel, list[torch.Tensor]]:
+        geometry_only: bool = False,
+        scene_features_512: Optional[torch.Tensor] = None,
+        cond2d_features_512: Optional[torch.Tensor] = None,
+        fill_holes: bool = True,
+    ) -> tuple[Mesh | MeshWithVoxel, list[torch.Tensor]]:
+        """Generate geometry, optionally without loading or executing texture stages.
+
+        ``geometry_only=True`` requires only the sparse-structure and shape
+        stage selections in ``from_finetuned`` and returns an ordinary ``Mesh``.
+        Both output variants use the same joint (chunk-0) coordinate frame.
+
+        Optional feature caches have shape ``[1, views, tokens, channels]`` and
+        must preserve the exact order of ``sel``'s images. They may be stored on
+        CPU, and are neither re-encoded nor modified by this method. At 1024
+        resolution they replace only the SS stage's 512-resolution encoding.
+        ``fill_holes=False`` preserves any decoder-provided ``lattice_vertices``
+        correspondence; hole filling may change the topology and discards it.
+        """
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type not in ("512", "1024"):
             raise ValueError(f"FullSceneImagesTo3DPipeline supports '512' and '1024' only; got {pipeline_type!r}")
@@ -440,7 +457,31 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
                 raise ValueError(f"{name} must be a positive integer or None, got {value}")
         if isinstance(joint_decode_overlap_r_in, bool) or not isinstance(joint_decode_overlap_r_in, int) or joint_decode_overlap_r_in < 0:
             raise ValueError("joint_decode_overlap_r_in must be a nonnegative integer")
-        self._require_run_components(pipeline_type)
+        if not isinstance(fill_holes, bool):
+            raise ValueError("fill_holes must be a boolean")
+
+        def _validate_feature_cache(features, name, views):
+            if features is None:
+                return None
+            if not isinstance(features, torch.Tensor):
+                raise TypeError(f"{name} must be a torch.Tensor or None")
+            if features.ndim != 4 or features.shape[:2] != (1, views):
+                raise ValueError(f"{name} must have shape [1, {views}, tokens, channels]; got {tuple(features.shape)}")
+            if not features.is_floating_point() or min(features.shape[2:]) < 1:
+                raise ValueError(f"{name} requires floating point values and positive token/channel dimensions")
+            if not torch.isfinite(features).all().item():
+                raise ValueError(f"{name} contains nonfinite values")
+            return features.detach()
+
+        scene_features_512 = _validate_feature_cache(scene_features_512, "scene_features_512", len(sel.scene_images_512))
+        cond2d_features_512 = _validate_feature_cache(cond2d_features_512, "cond2d_features_512", len(sel.cond2d_images_512))
+        if scene_features_512 is not None:
+            expected_views = scene_features_512.shape[1]
+            if len(sel.scene_extrinsics_c0) != expected_views or len(sel.scene_intrinsics) != expected_views:
+                raise ValueError("scene_features_512 view count must match scene extrinsics and intrinsics")
+        if cond2d_features_512 is not None and cond2d_features_512.shape[1] != len(sel.chunk_indices):
+            raise ValueError("cond2d_features_512 requires one view per selected chunk")
+        self._require_run_components(pipeline_type, geometry_only=geometry_only)
 
         num_chunks = len(sel.chunk_indices)
         torch.manual_seed(seed)
@@ -458,8 +499,12 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
             return nullcontext()
 
         # DINO processes small image batches; low_vram caches all tokens on CPU.
-        scene_feats_512 = self._encode_scene(sel.scene_images_512, 512)  # [1, N, T, D]
-        cond2d_feats_512 = self._encode_scene(torch.stack(sel.cond2d_images_512), 512)  # [1, K, T, D]
+        scene_feats_512 = (scene_features_512 if scene_features_512 is not None
+                           else self._encode_scene(sel.scene_images_512, 512))  # [1, N, T, D]
+        cond2d_feats_512 = (cond2d_features_512 if cond2d_features_512 is not None
+                            else self._encode_scene(torch.stack(sel.cond2d_images_512), 512))  # [1, K, T, D]
+        if scene_feats_512.shape[2:] != cond2d_feats_512.shape[2:]:
+            raise ValueError("scene and cond2d 512 features must have identical token/channel dimensions")
         if pipeline_type == "1024":
             scene_feats_stage = self._encode_scene(scene_imgs_for_stage, 1024)
             cond2d_feats_stage = self._encode_scene(torch.stack(cond2d_imgs_for_stage), 1024)
@@ -563,61 +608,62 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         shape_slat_list = [s * std + mean for s in shape_slat_raw]
         del shape_slat_raw
 
-        # ── Stage 3: Tex SLat ─────────────────────────────────────────────────
-        tex_model = self.models[tex_model_key]
-        tex_std = torch.tensor(self.tex_slat_normalization["std"])[None].to(self.device)
-        tex_mean = torch.tensor(self.tex_slat_normalization["mean"])[None].to(self.device)
+        if not geometry_only:
+            # ── Stage 3: Tex SLat ─────────────────────────────────────────────────
+            tex_model = self.models[tex_model_key]
+            tex_std = torch.tensor(self.tex_slat_normalization["std"])[None].to(self.device)
+            tex_mean = torch.tensor(self.tex_slat_normalization["mean"])[None].to(self.device)
 
-        shape_slat_norm = [(s - mean) / std for s in shape_slat_list]
+            shape_slat_norm = [(s - mean) / std for s in shape_slat_list]
 
-        scene_ext_tex, scene_intr_tex = self._prep_extrinsics_intrinsics(
-            sel.scene_extrinsics_c0,
-            sel.scene_intrinsics,
-            tex_model.dtype,
-        )
-        tex_conds = self._build_global_sparse_cond(
-            tex_model,
-            scene_feats_stage.to(tex_model.dtype),
-            cond2d_feats_stage.to(tex_model.dtype),
-            scene_ext_tex,
-            scene_intr_tex,
-            [sn.coords for sn in shape_slat_norm],
-            relative_translations,
-            tex_model.resolution,
-            zero_3d_cond=zero_3d_cond,
-        )
-        noise_tex = [
-            sn.replace(
-                feats=torch.randn(
-                    sn.coords.shape[0],
-                    tex_model.in_channels - sn.feats.shape[1],
-                    device=self.device,
-                )
+            scene_ext_tex, scene_intr_tex = self._prep_extrinsics_intrinsics(
+                sel.scene_extrinsics_c0,
+                sel.scene_intrinsics,
+                tex_model.dtype,
             )
-            for sn in shape_slat_norm
-        ]
-        chunk_kwargs_tex = [{"concat_cond": sn} for sn in shape_slat_norm]
-        params_tex = {**self.tex_slat_sampler_params, **tex_slat_sampler_params}
-
-        if self.low_vram:
-            tex_model.to(self.device)
-        with _amp_ctx(tex_model):
-            tex_slat_raw = MultiDiffusionOrchestrator(self.tex_slat_sampler).sample(
+            tex_conds = self._build_global_sparse_cond(
                 tex_model,
-                noise_tex,
-                [c["cond"] for c in tex_conds],
-                [c["neg_cond"] for c in tex_conds],
+                scene_feats_stage.to(tex_model.dtype),
+                cond2d_feats_stage.to(tex_model.dtype),
+                scene_ext_tex,
+                scene_intr_tex,
+                [sn.coords for sn in shape_slat_norm],
                 relative_translations,
-                **params_tex,
-                tqdm_desc="Sampling texture SLat",
-                chunk_kwargs=chunk_kwargs_tex,
+                tex_model.resolution,
+                zero_3d_cond=zero_3d_cond,
             )
-        if self.low_vram:
-            tex_model.cpu()
-        del tex_conds, noise_tex, chunk_kwargs_tex, shape_slat_norm
+            noise_tex = [
+                sn.replace(
+                    feats=torch.randn(
+                        sn.coords.shape[0],
+                        tex_model.in_channels - sn.feats.shape[1],
+                        device=self.device,
+                    )
+                )
+                for sn in shape_slat_norm
+            ]
+            chunk_kwargs_tex = [{"concat_cond": sn} for sn in shape_slat_norm]
+            params_tex = {**self.tex_slat_sampler_params, **tex_slat_sampler_params}
 
-        tex_slat_list = [s * tex_std + tex_mean for s in tex_slat_raw]
-        del tex_slat_raw
+            if self.low_vram:
+                tex_model.to(self.device)
+            with _amp_ctx(tex_model):
+                tex_slat_raw = MultiDiffusionOrchestrator(self.tex_slat_sampler).sample(
+                    tex_model,
+                    noise_tex,
+                    [c["cond"] for c in tex_conds],
+                    [c["neg_cond"] for c in tex_conds],
+                    relative_translations,
+                    **params_tex,
+                    tqdm_desc="Sampling texture SLat",
+                    chunk_kwargs=chunk_kwargs_tex,
+                )
+            if self.low_vram:
+                tex_model.cpu()
+            del tex_conds, noise_tex, chunk_kwargs_tex, shape_slat_norm
+
+            tex_slat_list = [s * tex_std + tex_mean for s in tex_slat_raw]
+            del tex_slat_raw
 
         # ── Decode ────────────────────────────────────────────────────────────
         # Preserve the original defaults; either resolution may opt into the
@@ -648,13 +694,27 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         del shape_slat_list
         torch.cuda.empty_cache()
 
+        if geometry_only:
+            # The shape decoder already yields the final triangle surface. Its
+            # subdivision context is needed only by the texture decoder.
+            del decode_ctx, joint_meta
+            if fill_holes:
+                if hasattr(scene_mesh, "lattice_vertices"):
+                    del scene_mesh.lattice_vertices
+                with _vram_peak("fill_holes (scene)"):
+                    scene_mesh.fill_holes()
+            return scene_mesh, coords_list
+
         with _vram_peak(f"joint_decode_tex ({num_chunks} chunks, res={res})"):
             joint_tex = self.joint_decode_tex_slats(tex_slat_list, decode_ctx, relative_translations)
         del tex_slat_list, decode_ctx, joint_meta
         torch.cuda.empty_cache()
 
-        with _vram_peak("fill_holes (scene)"):
-            scene_mesh.fill_holes()
+        if fill_holes:
+            if hasattr(scene_mesh, "lattice_vertices"):
+                del scene_mesh.lattice_vertices
+            with _vram_peak("fill_holes (scene)"):
+                scene_mesh.fill_holes()
 
         # Build one scene-wide MeshWithVoxel in the joint frame (chunk-0 local).
         voxel_shape = torch.Size([1, joint_tex.feats.shape[1], *grid_size_fine.tolist()])

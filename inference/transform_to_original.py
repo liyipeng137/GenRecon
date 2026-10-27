@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import trimesh
 
-from genrecon.representations import MeshWithVoxel
+from genrecon.representations import Mesh, MeshWithVoxel
 from genrecon.utils.mesh_utils import write_pbr_ply
 
 
@@ -19,15 +19,19 @@ def _apply_transform(points: torch.Tensor, transform: torch.Tensor) -> torch.Ten
 
 def save_mesh_to_original(
     out_path: str | Path,
-    mesh: MeshWithVoxel,
+    mesh: Mesh,
     chunk_to_original: torch.Tensor,
 ) -> None:
-    """map vertices to world frame, write PBR PLY."""
+    """Map vertices to world frame; preserve PBR attributes when present."""
     vertices = _apply_transform(
         mesh.vertices.detach().cpu().float(),
         chunk_to_original.detach().cpu().float(),
     ).numpy()
     faces = mesh.faces.detach().cpu().numpy().astype(np.int32, copy=False)
+
+    if not isinstance(mesh, MeshWithVoxel):
+        trimesh.Trimesh(vertices=vertices, faces=faces, process=False).export(str(out_path))
+        return
 
     attrs = mesh.query_vertex_attrs().detach().cpu().numpy()
     layout = mesh.layout

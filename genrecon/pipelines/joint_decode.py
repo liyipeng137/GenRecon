@@ -393,6 +393,18 @@ def joint_decode_shape(
         ]
         assert len(meshes) == 1, f"expected batch size 1, got {len(meshes)}"
         scene_mesh = meshes[0]
+        # Stable ownership anchors for independently generated local meshes.
+        # In inference the dual-grid extractor preserves one vertex per input
+        # voxel, in the same order. Neural offsets must not decide which local
+        # reconstruction owns a boundary triangle. Valid until mesh topology
+        # is changed (e.g. fill_holes); callers opting out of those operations
+        # can export these anchors alongside the raw mesh.
+        assert scene_mesh.vertices.shape[0] == h_joint.coords.shape[0]
+        scene_mesh.lattice_vertices = (
+            (h_joint.coords[:, 1:].float() + 0.5)
+            * ((aabb[1] - aabb[0]) / grid_size_fine)
+            + aabb[0]
+        )
         ctx = JointDecodeContext(
             inflated_aabbs=None,
             owned_aabbs=None,
@@ -530,6 +542,11 @@ def joint_decode_shape(
     representative = order[keep_mask]  # one original index per unique key, in unique-key order
     final_verts_dedup = final_verts[representative]
     final_faces_dedup = inverse[final_faces.long()].to(final_faces.dtype)
+    lattice_vertices = (
+        (voxel_coords_all[representative].float() + 0.5)
+        * ((aabb[1] - aabb[0]) / grid_size_fine)
+        + aabb[0]
+    )
     del final_verts, voxel_coords_all, keys, inverse, order, inverse_sorted, keep_mask, representative
     torch.cuda.empty_cache()
 
@@ -539,6 +556,7 @@ def joint_decode_shape(
     )
 
     scene_mesh = Mesh(final_verts_dedup, final_faces_dedup)
+    scene_mesh.lattice_vertices = lattice_vertices
     ctx = JointDecodeContext(
         inflated_aabbs=inflated_aabbs,
         owned_aabbs=owned_aabbs,
