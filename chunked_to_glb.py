@@ -157,7 +157,7 @@ def main() -> None:
     except Exception:
         print("[chunked_to_glb] FAILED:")
         traceback.print_exc()
-        return
+        raise SystemExit(1)
 
     elapsed = time.perf_counter() - t0
     if args.dump_geometry_plys:
