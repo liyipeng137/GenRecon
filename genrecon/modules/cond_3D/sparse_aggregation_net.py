@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from .. import sparse as sp
@@ -69,6 +70,7 @@ class MultiViewFeatAggregator(nn.Module):
 
         assert D == self.channels, f"expected dimension {self.channels} but got {D}"
         assert mask.shape == (S, N), f"expected mask to be of shape {(S, N)} but got {mask.shape}"
+        assert mask.dtype == torch.bool, f"expected boolean mask, got {mask.dtype}"
 
         mask_f = mask.unsqueeze(-1)  # [S, N 1]
         sum_valid = mask_f.sum(dim=1, keepdim=True).clamp_min(1)  # [S, 1, 1]
@@ -77,16 +79,27 @@ class MultiViewFeatAggregator(nn.Module):
         mu = (feats * mask_f).sum(dim=1, keepdim=True) / sum_valid  # [S, 1, D]
         var = (((feats - mu) ** 2) * mask_f).sum(dim=1, keepdim=True) / sum_valid
 
-        mu_exp = mu.expand(-1, N, -1)
-        var_exp = var.expand(-1, N, -1)
+        # Linear(cat([feats, mu, var])) = Wx*feats + Wm*mu + Wv*var + b.
+        # Project the shared statistics once, then broadcast their result.
+        # This preserves all trained weights and avoids an [S, N, 3*D] copy.
+        def first_layer(mlp):
+            weight, bias = mlp[0].weight, mlp[0].bias
+            return (
+                F.linear(feats, weight[:, :D])
+                + F.linear(mu, weight[:, D : 2 * D])
+                + F.linear(var, weight[:, 2 * D :])
+                + bias
+            )
 
-        h = torch.cat([feats, mu_exp, var_exp], dim=-1)  # [S, N, 3*D]
-        h_flat = h.reshape(S * N, 3 * D)
+        h = first_layer(self.feature_mlp)
+        for layer in self.feature_mlp[1:]:
+            h = layer(h)
+        feats_prime = h
 
-        feats_prime = self.feature_mlp(h_flat).reshape(S, N, D)
-
-        w_logits = self.weight_mlp(h_flat).reshape(S, N, 1)
-        w_logits = w_logits.masked_fill(~mask_f, -1e9)
+        w_logits = first_layer(self.weight_mlp)
+        for layer in self.weight_mlp[1:]:
+            w_logits = layer(w_logits)
+        w_logits = w_logits.masked_fill(~mask_f, torch.finfo(w_logits.dtype).min)
         w = torch.softmax(w_logits, dim=1)
         w = torch.where(all_invalid, torch.zeros_like(w), w)
 

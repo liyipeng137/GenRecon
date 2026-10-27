@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -36,6 +37,14 @@ STAGE_RESOLUTION_BY_MODEL_KEY = {
     "shape_slat_flow_model_1024": 1024,
     "tex_slat_flow_model_512": 512,
     "tex_slat_flow_model_1024": 1024,
+}
+
+# The published checkpoints are distributed as standalone .pt files rather
+# than the training run's ckpts/ + config.json directory layout.
+PUBLISHED_CHECKPOINT_CONFIGS = {
+    "sparse_structure.pt": "configs/gen/ss_flow_img/genrecon.json",
+    "shape_slat.pt": "configs/gen/slat_flow_img2shape/genrecon_512.json",
+    "texture_slat.pt": "configs/gen/slat_flow_imgshape2tex/genrecon_512.json",
 }
 
 
@@ -207,6 +216,7 @@ def load_sparse_flow_stage(ckpt_path: str, train_config_path: str | None = None)
         allowed_model_names={"SparseStructureFlowModel"},
     )
     model, load_report = build_and_load_model(flow_cfg, ckpt_path)
+    load_report["training_config_path"] = resolve_train_config_path(ckpt_path, train_config_path)
     num_cond_views = extract_num_cond_views(train_cfg)
     image_size = extract_image_size(train_cfg)
     return LoadedStage(
@@ -230,6 +240,7 @@ def load_slat_stage(
         allowed_model_names=allowed_model_names,
     )
     model, load_report = build_and_load_model(flow_cfg, ckpt_path)
+    load_report["training_config_path"] = resolve_train_config_path(ckpt_path, train_config_path)
     output_resolution = extract_output_resolution(train_cfg, flow_cfg)
     num_cond_views = extract_num_cond_views(train_cfg)
     image_size = extract_image_size(train_cfg)
@@ -319,16 +330,30 @@ def extract_output_resolution(train_cfg: dict, flow_cfg: dict) -> int:
     return output_resolution
 
 
-def load_train_config(ckpt_path: str, train_config_path: str | None = None) -> dict:
+def resolve_train_config_path(ckpt_path: str, train_config_path: str | None = None) -> str:
+    """Resolve explicit, training-run, then known published checkpoint configs.
+
+    An existing run config always wins over the published-name fallback, and
+    arbitrary checkpoint names never silently acquire a model architecture.
+    """
     if train_config_path is not None:
-        config_path = train_config_path
+        config_path = os.path.abspath(train_config_path)
     else:
         ckpt_dir = os.path.dirname(os.path.abspath(ckpt_path))
         run_dir = os.path.dirname(ckpt_dir)
         config_path = os.path.join(run_dir, "config.json")
+        if not os.path.exists(config_path):
+            published_config = PUBLISHED_CHECKPOINT_CONFIGS.get(os.path.basename(ckpt_path))
+            if published_config is not None:
+                config_path = str(Path(__file__).resolve().parents[2] / published_config)
 
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Training config not found: {config_path}")
+    return config_path
+
+
+def load_train_config(ckpt_path: str, train_config_path: str | None = None) -> dict:
+    config_path = resolve_train_config_path(ckpt_path, train_config_path)
     with open(config_path, "r") as f:
         return json.load(f)
 

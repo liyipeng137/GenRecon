@@ -112,7 +112,10 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         zero_3d_cond: bool = False,
     ) -> list[dict]:
         if not hasattr(flow_model, "projection") or not hasattr(flow_model, "aggregator"):
-            return [self._assemble_cond(cond_2D=cond2d_feats[:, i], cond_3D=None) for i in range(cond2d_feats.shape[1])]
+            return [self._assemble_cond(cond_2D=cond2d_feats[:, i].to(self.device), cond_3D=None) for i in range(cond2d_feats.shape[1])]
+
+        scene_feats = scene_feats.to(device=self.device, dtype=flow_model.dtype)
+        cond2d_feats = cond2d_feats.to(device=self.device, dtype=flow_model.dtype)
 
         offsets, (GX, GY, GZ), mins = self._global_grid_layout(rel_t, R)
         pts = self._global_grid_points(mins, GX, GY, GZ, R).to(
@@ -169,7 +172,10 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         zero_3d_cond: bool = False,
     ) -> list[dict]:
         if not hasattr(flow_model, "projection") or not hasattr(flow_model, "aggregator"):
-            return [self._assemble_cond(cond_2D=cond2d_feats[:, i], cond_3D=None) for i in range(cond2d_feats.shape[1])]
+            return [self._assemble_cond(cond_2D=cond2d_feats[:, i].to(self.device), cond_3D=None) for i in range(cond2d_feats.shape[1])]
+
+        scene_feats = scene_feats.to(device=self.device, dtype=flow_model.dtype)
+        cond2d_feats = cond2d_feats.to(device=self.device, dtype=flow_model.dtype)
 
         offsets, (GX, GY, GZ), mins = self._global_grid_layout(rel_t, R)
         offsets_dev = offsets.to(coords_list[0].device)
@@ -388,6 +394,17 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         """DINO-encode a stack of images [M, C, H, W] → [1, M, T, D]."""
         return self._encode_conditioning_tokens(images.unsqueeze(0), resolution=resolution)
 
+    def _make_sparse_structure_noise(self, flow_model, num_chunks: int) -> list[torch.Tensor]:
+        """Sample on the flow model's latent grid, not the decoded occupancy grid."""
+        latent_res = flow_model.resolution
+        return [
+            torch.randn(
+                1, flow_model.in_channels, latent_res, latent_res, latent_res,
+                dtype=getattr(flow_model, "dtype", torch.float32), device=self.device,
+            )
+            for _ in range(num_chunks)
+        ]
+
     def _prep_extrinsics_intrinsics(
         self, ext: torch.Tensor, intr: torch.Tensor, dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -408,10 +425,21 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         pipeline_type: Optional[str] = None,
         occ_threshold: float = 0.0,
         zero_3d_cond: bool = False,
+        joint_decode_max_chunks_per_group: Optional[int] = None,
+        joint_decode_max_inflated_voxels: Optional[int] = None,
+        joint_decode_overlap_r_in: int = 16,
     ) -> tuple[MeshWithVoxel, list[torch.Tensor]]:
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type not in ("512", "1024"):
             raise ValueError(f"FullSceneImagesTo3DPipeline supports '512' and '1024' only; got {pipeline_type!r}")
+        for name, value in (
+            ("joint_decode_max_chunks_per_group", joint_decode_max_chunks_per_group),
+            ("joint_decode_max_inflated_voxels", joint_decode_max_inflated_voxels),
+        ):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                raise ValueError(f"{name} must be a positive integer or None, got {value}")
+        if isinstance(joint_decode_overlap_r_in, bool) or not isinstance(joint_decode_overlap_r_in, int) or joint_decode_overlap_r_in < 0:
+            raise ValueError("joint_decode_overlap_r_in must be a nonnegative integer")
         self._require_run_components(pipeline_type)
 
         num_chunks = len(sel.chunk_indices)
@@ -429,7 +457,7 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
                 return torch.autocast(device_type="cuda", dtype=model.dtype)
             return nullcontext()
 
-        # ── One-shot DINO: scene set (512 always; 1024 if needed) + per-chunk 2D cond ─
+        # DINO processes small image batches; low_vram caches all tokens on CPU.
         scene_feats_512 = self._encode_scene(sel.scene_images_512, 512)  # [1, N, T, D]
         cond2d_feats_512 = self._encode_scene(torch.stack(sel.cond2d_images_512), 512)  # [1, K, T, D]
         if pipeline_type == "1024":
@@ -456,18 +484,7 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
             ss_model.resolution,  # flow model samples at latent res; ss_res is the decoded occ res.
             zero_3d_cond=zero_3d_cond,
         )
-        noise_ss = [
-            torch.randn(
-                1,
-                ss_model.in_channels,
-                ss_res,
-                ss_res,
-                ss_res,
-                dtype=getattr(ss_model, "dtype", torch.float32),
-                device=self.device,
-            )
-            for _ in range(num_chunks)
-        ]
+        noise_ss = self._make_sparse_structure_noise(ss_model, num_chunks)
         params_ss = {**self.sparse_structure_sampler_params, **sparse_structure_sampler_params}
 
         if self.low_vram:
@@ -603,8 +620,8 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         del tex_slat_raw
 
         # ── Decode ────────────────────────────────────────────────────────────
-        # Chunked joint decode is enabled for the 1024 pipeline only; 512 keeps
-        # the original single-pass behavior verbatim.
+        # Preserve the original defaults; either resolution may opt into the
+        # existing spatially grouped decoder when memory requires it.
         #
         # max_inflated_voxels caps the *actual* number of voxels the per-group
         # forward will see (joint_slat coords inside the inflated AABB) — the
@@ -612,8 +629,12 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         # an 80 GB card; in=164K → 63 GB peak with no headroom for the next
         # group. 100K leaves ~35 GB headroom for cumulative state + safety.
         # max_chunks_per_group is a soft secondary bound for very sparse scenes.
-        max_chunks_per_group = 10 if pipeline_type == "1024" else None
-        max_inflated_voxels = 100_000 if pipeline_type == "1024" else None
+        max_chunks_per_group = joint_decode_max_chunks_per_group
+        if max_chunks_per_group is None and pipeline_type == "1024":
+            max_chunks_per_group = 10
+        max_inflated_voxels = joint_decode_max_inflated_voxels
+        if max_inflated_voxels is None and pipeline_type == "1024":
+            max_inflated_voxels = 100_000
         torch.cuda.empty_cache()
         with _vram_peak(f"joint_decode_shape ({num_chunks} chunks, res={res})"):
             scene_mesh, aabb, grid_size_fine, decode_ctx, joint_meta = self.joint_decode_shape_slats(
@@ -622,6 +643,7 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
                 relative_translations,
                 max_chunks_per_group=max_chunks_per_group,
                 max_inflated_voxels=max_inflated_voxels,
+                overlap_r_in=joint_decode_overlap_r_in,
             )
         del shape_slat_list
         torch.cuda.empty_cache()

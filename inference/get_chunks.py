@@ -570,6 +570,7 @@ class IphoneChunker(BaseChunker, IphoneMixin):
         radius_m: float | None = None,
         manual_xy_bounds: tuple[float, float, float, float] | None = None,
         min_points_per_chunk: int | None = None,
+        skip_point_cleaning: bool = False,
     ) -> None:
         super().__init__(min_overlap_factor=min_overlap_factor)
         self.chunk_size_factor = chunk_size_factor
@@ -578,5 +579,6 @@ class IphoneChunker(BaseChunker, IphoneMixin):
         self.radius_nb_points = radius_nb_points
         self.radius_m = radius_m
         self.manual_xy_bounds = manual_xy_bounds
+        self.skip_point_cleaning = skip_point_cleaning
         if min_points_per_chunk is not None:
             self.min_points_per_chunk = min_points_per_chunk

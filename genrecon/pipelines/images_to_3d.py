@@ -78,9 +78,13 @@ class ImagesTo3DPipeline(Pipeline):
         cls,
         stage_models: dict[str, str | None],
         pipeline_config_file: str | None = None,
+        stage_train_configs: dict[str, str] | None = None,
     ) -> "ImagesTo3DPipeline":
         """Build a partially loaded pipeline from explicit pretrained or finetuned stage selections."""
         validate_requested_stage_models(stage_models)
+        stage_train_configs = stage_train_configs or {}
+        if set(stage_train_configs) - set(stage_models):
+            raise ValueError("stage_train_configs keys must also be present in stage_models")
 
         args = load_pipeline_args(pipeline_config_file or cls.DEFAULT_PIPELINE_CONFIG_FILE)
         pipeline = cls(models={})
@@ -105,17 +109,21 @@ class ImagesTo3DPipeline(Pipeline):
                 continue
 
             if model_key == "sparse_structure_flow_model":
-                loaded = load_sparse_flow_stage(ckpt_path=ckpt_path)
+                loaded = load_sparse_flow_stage(
+                    ckpt_path=ckpt_path, train_config_path=stage_train_configs.get(model_key)
+                )
             elif model_key.startswith("shape_slat_flow_model_"):
                 loaded = load_slat_stage(
                     ckpt_path=ckpt_path,
                     allowed_model_names={"SLatFlowModel", "ElasticSLatFlowModel"},
+                    train_config_path=stage_train_configs.get(model_key),
                 )
                 validate_loaded_stage_resolution(model_key, loaded.output_resolution)
             elif model_key.startswith("tex_slat_flow_model_"):
                 loaded = load_slat_stage(
                     ckpt_path=ckpt_path,
                     allowed_model_names={"SLatFlowModel", "ElasticSLatFlowModel"},
+                    train_config_path=stage_train_configs.get(model_key),
                 )
                 validate_loaded_stage_resolution(model_key, loaded.output_resolution)
             else:
@@ -222,10 +230,18 @@ class ImagesTo3DPipeline(Pipeline):
         if self.low_vram:
             self.image_cond_model.to(self.device)
 
-        cond = self.image_cond_model(cond_input.to(self.device))
-
-        if self.low_vram:
-            self.image_cond_model.cpu()
+        try:
+            if hasattr(self.image_cond_model, "encode_batched"):
+                # Transfer only one image batch to the model. Full-scene
+                # features are cached on CPU while their stages are inactive.
+                cond = self.image_cond_model.encode_batched(
+                    cond_input, output_device="cpu" if self.low_vram else self.device
+                )
+            else:
+                cond = self.image_cond_model(cond_input.to(self.device))
+        finally:
+            if self.low_vram:
+                self.image_cond_model.cpu()
 
         return cond
 
@@ -281,6 +297,7 @@ class ImagesTo3DPipeline(Pipeline):
             cond_input = self._build_conditioning_tensor(stage_images, resolution=resolution)
             img_feats_all = self._encode_conditioning_tokens(cond_input, resolution=resolution)
 
+        img_feats_all = img_feats_all.to(self.device)
         cond_2D = img_feats_all[:, 0]  # [B, T, D] — first-view tokens for cross-attention
 
         if flow_model is not None and hasattr(flow_model, "dtype"):

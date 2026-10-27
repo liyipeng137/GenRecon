@@ -169,6 +169,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ss_ckpt", default=None)
     parser.add_argument("--shape_ckpt", default=None)
     parser.add_argument("--tex_ckpt", default=None)
+    parser.add_argument("--ss_train_config", default=None)
+    parser.add_argument("--shape_train_config", default=None)
+    parser.add_argument("--tex_train_config", default=None)
     parser.add_argument("--pipeline", choices=["512"], default="512")
     parser.add_argument(
         "--pipeline_config",
@@ -179,6 +182,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num_imgs_per_scene", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--image_batch_size", type=int, default=2,
+                        help="Number of independent images encoded by DINO per forward pass.")
+    parser.add_argument("--joint_decode_max_chunks_per_group", type=int, default=None,
+                        help="Optional spatial group limit for shape decoding, including pipeline 512.")
+    parser.add_argument("--joint_decode_max_inflated_voxels", type=int, default=None,
+                        help="Optional input-token limit for spatially grouped shape decoding.")
+    parser.add_argument("--joint_decode_overlap_r_in", type=int, default=16,
+                        help="Input-voxel overlap halo for grouped shape decoding.")
     parser.add_argument(
         "--save_imgs",
         action="store_true",
@@ -296,6 +307,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    for name in ("image_batch_size", "proj_batch_voxels", "joint_decode_max_chunks_per_group",
+                 "joint_decode_max_inflated_voxels", "joint_decode_overlap_r_in"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name} must be positive")
 
     missing = [
         n
@@ -324,7 +340,15 @@ def main() -> None:
             f"tex_slat_flow_model_{args.pipeline}": args.tex_ckpt,
         },
         pipeline_config_file=args.pipeline_config,
+        stage_train_configs={key: value for key, value in {
+            "sparse_structure_flow_model": args.ss_train_config,
+            f"shape_slat_flow_model_{args.pipeline}": args.shape_train_config,
+            f"tex_slat_flow_model_{args.pipeline}": args.tex_train_config,
+        }.items() if value is not None},
     )
+    pipeline.image_cond_model.batch_size = args.image_batch_size
+    with (out_path / "checkpoint_load_report.json").open("w", encoding="utf-8") as f:
+        json.dump(pipeline._checkpoint_load_report, f, indent=2, sort_keys=True)
     if args.proj_batch_voxels is not None:
         pipeline.proj_batch_voxels = args.proj_batch_voxels
     pipeline.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
@@ -380,6 +404,19 @@ def main() -> None:
         seed=args.seed,
     )
     rel_t_kept = [rel_t[i] for i in sel.chunk_indices]
+    selected_cameras = json.loads((out_path / "cameras.json").read_text())["scene"]
+    selected_summary = {
+        "requested_original_images": args.num_imgs_per_scene,
+        "selected_original_images": len({c["img_path"] for c in selected_cameras}),
+        "selected_crop_views": len(selected_cameras),
+        "scene_images_512_shape": list(sel.scene_images_512.shape),
+        "chunk_count": len(sel.chunk_indices),
+        "chunk_indices": list(sel.chunk_indices),
+        "image_batch_size": args.image_batch_size,
+        "low_vram": pipeline.low_vram,
+    }
+    (out_path / "selected_input_summary.json").write_text(json.dumps(selected_summary, indent=2) + "\n")
+    print("Selected input:", json.dumps(selected_summary), flush=True)
 
     if args.save_imgs:
         scene_dir = out_path / "scene"
@@ -407,6 +444,9 @@ def main() -> None:
         shape_slat_sampler_params=slat_sampler_params,
         tex_slat_sampler_params=slat_sampler_params,
         occ_threshold=args.occ_threshold,
+        joint_decode_max_chunks_per_group=args.joint_decode_max_chunks_per_group,
+        joint_decode_max_inflated_voxels=args.joint_decode_max_inflated_voxels,
+        joint_decode_overlap_r_in=args.joint_decode_overlap_r_in,
     )
 
     coords_resolution = pipeline.models[f"shape_slat_flow_model_{args.pipeline}"].resolution
