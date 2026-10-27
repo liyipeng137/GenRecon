@@ -332,6 +332,8 @@ def joint_decode_shape(
     max_chunks_per_group: Optional[int] = None,
     max_inflated_voxels: Optional[int] = None,
     overlap_r_in: int = 16,
+    output_device: Optional[str] = None,
+    retain_subdivision_context: bool = True,
 ) -> Tuple[Mesh, torch.Tensor, torch.Tensor, JointDecodeContext, Dict]:
     """Joint shape decode + joint mesh extraction.
 
@@ -346,7 +348,14 @@ def joint_decode_shape(
 
     Returns ``(scene_mesh, aabb, grid_size_fine, ctx, meta)``. ``ctx`` is
     consumed by :func:`joint_decode_tex`.
+
+    Geometry-only callers can request ``output_device="cpu"`` to merge the
+    extracted parts without a full-scene GPU concat/sort, and disable retained
+    subdivision tensors when no texture decode will follow. Neither option
+    changes per-group neural inference or exclusive face ownership.
     """
+    if output_device not in (None, "cpu"):
+        raise ValueError("output_device must be None (decoder device) or 'cpu'")
     num_up = len(decoder.num_blocks) - 1
     R_in = decoder.resolution // (2**num_up)
     upscale = decoder.resolution // R_in
@@ -408,10 +417,14 @@ def joint_decode_shape(
         ctx = JointDecodeContext(
             inflated_aabbs=None,
             owned_aabbs=None,
-            subs_inflated=[joint_subs],
+            subs_inflated=[joint_subs] if retain_subdivision_context else [],
             R_in=R_in,
             upscale=upscale,
         )
+        if output_device == "cpu":
+            anchors = scene_mesh.lattice_vertices.cpu()
+            scene_mesh = Mesh(scene_mesh.vertices.cpu(), scene_mesh.faces.cpu())
+            scene_mesh.lattice_vertices = anchors
         return scene_mesh, aabb, grid_size_fine, ctx, meta
 
     # ── Chunked: spatially group chunks, decode + mesh-extract per group ──
@@ -449,6 +462,7 @@ def joint_decode_shape(
     inflated_aabbs: List[torch.Tensor] = []
     owned_aabbs: List[torch.Tensor] = []
     subs_inflated_per_group: List[List[SparseTensor]] = []
+    group_reports = []
 
     for g_idx, group in enumerate(groups):
         owned_aabb = _group_owned_aabb(group, offsets_minus_mins, R_in)
@@ -498,7 +512,9 @@ def joint_decode_shape(
 
         inflated_aabbs.append(inflated_aabb)
         owned_aabbs.append(owned_aabb)
-        subs_inflated_per_group.append([_sparse_cpu_clean(s) for s in subs_g])
+        subs_inflated_per_group.append([_sparse_cpu_clean(s) for s in subs_g] if retain_subdivision_context else [])
+        group_reports.append(dict(group=g_idx, chunks=group, input_voxels=int(n_in),
+                                  vertices=int(mesh_v_compact.shape[0]), faces=int(mesh_f_compact.shape[0])))
 
         print(
             f"[joint_decode_shape] group {g_idx}: chunks={group} in={n_in:,} → "
@@ -509,6 +525,21 @@ def joint_decode_shape(
         del mesh_v_g, mesh_f_g, mesh_f_owned, used_v, remap
         del mesh_v_compact, mesh_f_compact, voxel_coords_compact, in_owned
         torch.cuda.empty_cache()
+
+    if output_device == "cpu":
+        from .lattice_mesh_merge import merge_cpu_lattice_parts
+        vertices, faces, anchors, report = merge_cpu_lattice_parts(
+            mesh_v_parts, mesh_f_parts, voxel_coords_parts, aabb.cpu(), grid_size_fine.cpu())
+        report.update(groups=group_reports, overlap_r_in=overlap_r_in,
+                      retained_subdivision_context=retain_subdivision_context)
+        scene_mesh = Mesh(vertices, faces)
+        scene_mesh.lattice_vertices = anchors
+        scene_mesh.merge_report = report
+        ctx = JointDecodeContext(inflated_aabbs=inflated_aabbs, owned_aabbs=owned_aabbs,
+                                 subs_inflated=subs_inflated_per_group, R_in=R_in, upscale=upscale,
+                                 chunk_origins=chunk_origins.cpu(), groups=groups)
+        print(f"[joint_decode_shape] CPU merged: {len(vertices):,} verts, {len(faces):,} faces", flush=True)
+        return scene_mesh, aabb, grid_size_fine, ctx, meta
 
     # ── Concat per-group meshes + dedupe boundary vertices ────────────────
     # Vertices coming from different groups but corresponding to the same

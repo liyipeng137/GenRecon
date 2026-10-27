@@ -340,6 +340,8 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         max_chunks_per_group: Optional[int] = None,
         max_inflated_voxels: Optional[int] = None,
         overlap_r_in: int = 16,
+        output_device: Optional[str] = None,
+        retain_subdivision_context: bool = True,
     ) -> tuple[Mesh, torch.Tensor, torch.Tensor, JointDecodeContext, dict]:
         """Merge chunk SLats, run the shape decoder (single-pass or chunked
         with overlap), extract a single scene mesh via one
@@ -362,6 +364,8 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
             max_chunks_per_group=max_chunks_per_group,
             max_inflated_voxels=max_inflated_voxels,
             overlap_r_in=overlap_r_in,
+            output_device=output_device,
+            retain_subdivision_context=retain_subdivision_context,
         )
         if self.low_vram:
             dec.cpu()
