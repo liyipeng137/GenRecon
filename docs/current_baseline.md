@@ -7,7 +7,7 @@ The previous independent-chunk experiment remains a historical comparison.
 
 | Identity | Value |
 | --- | --- |
-| Frozen version tag | `baseline-joint-429-512-20261027` |
+| Frozen baseline branch | `codex/baseline-joint-429-512-20261027` |
 | Generation source commit | `9cbaac21abf64de1745c20b54af718f565b35324` |
 | Original result documentation commit | `5be8191` |
 | Machine-readable reference | [`configs/baselines/joint_429_512_20261027.json`](../configs/baselines/joint_429_512_20261027.json) |
@@ -17,10 +17,15 @@ The previous independent-chunk experiment remains a historical comparison.
 | Decoder groups / halo / soft voxel budget | 1 chunk / 16 coarse cells / 20,000 |
 | Full reference geometry | 28,258,066 vertices, 60,775,997 triangles |
 
-The tag includes the adoption documentation and registry. The generation source
-commit identifies the code that actually produced the reference. Promotion does
-not regenerate or modify its geometry. See [the method](joint_scene_reconstruction.md)
-and [the measured results](joint_scene_429_results.md).
+The baseline branch includes the adoption documentation and registry. Keep it
+fixed when advancing `main` for later experiments. The generation commit records
+the original local experiment; publication through the GitHub connector creates
+a source snapshot with its own commit identity. Runtime file hashes in the
+registry preserve the link to the code that produced the reference. The original
+experiment history remains locally on `codex/first60-4090`.
+Promotion does not regenerate or modify the geometry. See
+[the method](joint_scene_reconstruction.md) and
+[the measured results](joint_scene_429_results.md).
 
 ## Reference artifacts
 
