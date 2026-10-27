@@ -53,6 +53,13 @@ def main():
     simplify_seconds = time.monotonic() - simplify_start
     vg, fg = mesh.read()
     vertices, faces = vg.cpu().numpy(), fg.cpu().numpy()
+    # CuMesh can leave vertices no longer referenced by any surviving face.
+    # A downstream initializer may consume the complete vertex array, so do
+    # not export these inactive points as if they belonged to the surface.
+    referenced, inverse = np.unique(faces, return_inverse=True)
+    removed_unreferenced = len(vertices) - len(referenced)
+    vertices = vertices[referenced]
+    faces = inverse.reshape(-1, 3).astype(np.int32)
     target = output / "mesh.ply"
     write_mesh(target, vertices, faces)
     degenerate_indices = int(np.any(np.diff(np.sort(faces, axis=1), axis=1) == 0, axis=1).sum())
@@ -64,6 +71,7 @@ def main():
                   source_counts=source_counts, target_faces=args.target_faces,
                   mesh=str(target), sha256=digest_file(target), vertices=len(vertices), faces=len(faces),
                   degenerate_index_faces=degenerate_indices, geometry_only=True,
+                  removed_unreferenced_vertices=removed_unreferenced,
                   method="CuMesh QEM on completed globally owned mesh; no remeshing or texture",
                   source_preserved=True, seam_repair_performed=False,
                   simplify_seconds=simplify_seconds, seconds=time.monotonic()-start,
