@@ -2,9 +2,10 @@
 
 The [429-image experiment report](joint_scene_429_results.md) records measured
 resource use, matched-view comparisons, artifacts and the remaining ceiling defects.
+This joint output is the [adopted baseline](current_baseline.md) for future work.
 
-`scripts/reconstruct_joint_scene.py` compares joint generation against the
-independent 429-image baseline without changing the layout or conditioning.
+`scripts/reconstruct_joint_scene.py` runs joint generation using the original
+independent experiment's frozen layout and conditioning.
 It verifies the original 23 chunks, all 429 image hashes, 858 crop bindings,
 per-chunk image pools, exact 2D anchors, camera files, checkpoint metadata,
 sampler configuration and cached DINO features before loading models.
@@ -33,23 +34,34 @@ face ordering as the original GPU merge. Seven tests compare the merge numerical
 It exports diagnostics for predictions at shared lattice keys before choosing
 the representative; these diagnostics are not ground-truth accuracy metrics.
 
+The following example compares a new joint candidate to the adopted joint run.
+`OBSERVATIONS` is the old independent experiment used only for fixed input pools,
+anchors and the feature cache; `REFERENCE` is the adopted quality reference.
+Use a fresh `RUN` directory, never the reference output directory.
+
 ```bash
-python scripts/run_profiled.py --output RUN/attempt_01 -- \
+OBSERVATIONS=/kiri/output/scene_reconstruction/genrecon_local_mesh_20261027
+REFERENCE=/kiri/output/scene_reconstruction/genrecon_joint_429_20261027
+FULL_NORMALIZED_SCENE=/kiri/output/scene_reconstruction/genrecon_pose_selection_20261027/data_all529
+ORIGINAL_FFBA_SCENE=/kiri/529_prior_pose_and_k_moge3_20261021
+RUN=/kiri/output/scene_reconstruction/genrecon_candidate_001
+
+python scripts/run_profiled.py --output "$RUN/attempt_01" -- \
   python scripts/reconstruct_joint_scene.py \
-  --layout BASELINE/planning/layout.json \
-  --baseline-manifest BASELINE/attempt_01/result/manifest.json \
-  --data-dir FULL_NORMALIZED_SCENE --output RUN/result \
+  --layout "$OBSERVATIONS/planning/layout.json" \
+  --baseline-manifest "$OBSERVATIONS/attempt_01/result/manifest.json" \
+  --data-dir "$FULL_NORMALIZED_SCENE" --output "$RUN/result" \
   --proj-batch-voxels 256 --decode-overlap 16 \
   --decode-max-chunks 1 --decode-max-voxels 20000
 
 python scripts/inspect_ffba_large_result.py \
-  --result-dir RUN/result --data-dir FULL_NORMALIZED_SCENE \
-  --source-dataset ORIGINAL_FFBA_SCENE --output RUN/inspection --threads 4
+  --result-dir "$RUN/result" --data-dir "$FULL_NORMALIZED_SCENE" \
+  --source-dataset "$ORIGINAL_FFBA_SCENE" --output "$RUN/inspection" --threads 4
 
 python scripts/compare_scene_runs.py \
-  --baseline-inspection BASELINE/inspection \
-  --candidate-inspection RUN/inspection \
-  --camera-data-dir FULL_NORMALIZED_SCENE --output RUN/comparison
+  --baseline-inspection "$REFERENCE/inspection" \
+  --candidate-inspection "$RUN/inspection" \
+  --camera-data-dir "$FULL_NORMALIZED_SCENE" --output "$RUN/comparison"
 ```
 
 Sampling checkpoints and conditions are hash checked and CPU resident. Changing

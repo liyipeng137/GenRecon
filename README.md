@@ -19,6 +19,22 @@
 
 </div>
 
+## Current baseline in this fork
+
+The adopted reconstruction baseline is **joint 429-image geometry at 512
+resolution**: 23 fixed spatial chunks, CPU-resident conditions and sampling
+state, per-step overlap synchronization, and shared grouped geometry decoding.
+The user selected this output for its closer visual match to the captured scene.
+
+- [Baseline identity, artifact hashes and future comparison commands](docs/current_baseline.md)
+- [Joint reconstruction method](docs/joint_scene_reconstruction.md)
+- [Measured results and remaining defects](docs/joint_scene_429_results.md)
+
+For this large-scene workflow, use `scripts/reconstruct_joint_scene.py` and compare
+future outputs against the adopted joint run's **full-mesh inspection**. Keep the
+reference run unchanged and write each candidate to a new output directory.
+The upstream inference examples below remain available for their original uses.
+
 ## ✨ Abstract
 
 We introduce a new approach to high-fidelity 3D scene reconstruction from multi-view RGB images that tightly couples reconstruction with a strong generative 3D prior. We cast scene reconstruction as conditional 3D generation over a set of spatially-localized, overlapping chunks that together tile the scene, scaling generation to large scene extents. Crucially, we inherit the fidelity and completeness of state-of-the-art generative shape models -- we use Trellis.2 as an example -- which we generalize to the scene level. To this end, we propose a projection-based conditioning mechanism that lifts posed multi-view image features into a coherent 3D representation aligned with the generative model, independent of view ordering and spatially anchored to the scene, yielding high-fidelity, multi-view consistent generated geometry. This enables lifting the strong object-level prior of Trellis.2 to multi-view, scene-scale generation, producing faithful, editable PBR mesh reconstructions of indoor environments. As a result, we obtain high-fidelity results that outperform cutting-edge reconstruction methods by 16%.
@@ -33,7 +49,7 @@ We introduce a new approach to high-fidelity 3D scene reconstruction from multi-
 
 1. Clone the repo:
 ```sh
-git clone -b main https://github.com/kasothaphie/GenRecon.git --recursive
+git clone -b main https://github.com/liyipeng137/GenRecon.git --recursive
 cd GenRecon
 ```
 

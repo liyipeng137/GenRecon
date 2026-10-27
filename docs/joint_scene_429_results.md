@@ -1,11 +1,15 @@
 # Joint 429-image reconstruction, 2026-10-27
 
+**Adopted baseline:** after inspecting the output, the user selected this joint
+run as the formal basis for further development because it is visually closer
+to the real scene. Future candidates should be compared against this run's full
+mesh. See [the current baseline record](current_baseline.md).
+
 The joint scheme completed on one RTX 4090 at the original 512 resolution.
 Some regular chunk artifacts improve, especially the false stepped wall above
-the doorway in frame 453. It is not an overall quality win: ceiling voids remain
-or increase in frames 75 and 302. The result establishes that this execution
-scheme fits the machine, but does not establish that synchronized generation
-alone resolves the reconstruction defects.
+the doorway in frame 453. Metrics are mixed and ceiling voids remain or increase
+in frames 75 and 302. These limitations remain part of the adopted reference;
+synchronized generation alone has not resolved all reconstruction defects.
 
 ## Frozen inputs and implementation
 
