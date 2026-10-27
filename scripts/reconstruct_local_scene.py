@@ -207,6 +207,9 @@ def main():
                     proj_batch_voxels=args.proj_batch_voxels, image_batch_size=args.image_batch_size,
                     layout_sha256=digest_file(args.layout), selected_sha256=digest_file(args.selected_paths),
                     pipeline_config_sha256=digest_file(args.pipeline_config),
+                    camera_geometry_sha256={name:digest_file(args.data_dir/"colmap"/name)
+                                            for name in ("cameras.txt", "images.txt")},
+                    world_transform_sha256=digest_file(args.data_dir/"world_transform.json"),
                     git_head=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
                     images=[dict(name=n, size=Path(by_name[n]["img_path"]).stat().st_size,
                                  sha256=digest_file(by_name[n]["img_path"])) for n in names],
