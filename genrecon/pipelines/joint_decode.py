@@ -14,13 +14,15 @@ Joint frame convention:
     where ``rel_t`` is the chunker's ``relative_translation`` (unit =
     ``chunk_size``).
 
-Chunked decode (1024 pipeline only):
+Chunked decode:
   * For ``len(slats) > max_chunks_per_group``, chunks are spatially grouped
     via recursive longest-axis bisection until each leaf has
     ``≤ max_chunks_per_group`` chunks.
   * Each group's joint slat is inflated by ``overlap_r_in`` voxels (R_in
     scale) so the decoder's receptive field is intact at owned-region
-    boundaries; outputs are filtered back to the owned region and concatenated.
+    boundaries. Overlapping chunks share a deterministic exclusive ownership
+    rule: among the chunk cubes covering a point, its closest centre wins.
+    Faces and texture voxels use this same rule before concatenation.
   * The texture decoder reuses the same group structure and consumes each
     group's own subdivision tensors (no cross-group merging of subs).
 """
@@ -53,6 +55,8 @@ class JointDecodeContext:
     subs_inflated: List[List[SparseTensor]]  # per group, per stage (raw, no owned filter)
     R_in: int
     upscale: int
+    chunk_origins: Optional[torch.Tensor] = None  # all input chunk origins at R_in scale
+    groups: Optional[List[List[int]]] = None  # indices into chunk_origins per decode group
 
 
 def _merge_chunk_slats(
@@ -206,9 +210,88 @@ def _group_owned_aabb(
     offsets_minus_mins: List[torch.Tensor],
     R_in: int,
 ) -> torch.Tensor:
-    """Owned AABB ``[2, 3]`` at R_in scale in joint-frame integer coords."""
+    """Group support bounds, not exclusive ownership, at R_in scale.
+
+    Input chunks intentionally overlap; use these bounds only to select the
+    inflated decoder context. Output ownership is decided by the global rule.
+    """
     origins = torch.stack([offsets_minus_mins[i] for i in group_chunk_idx])
     return torch.stack([origins.min(dim=0).values, origins.max(dim=0).values + R_in])
+
+
+def _exclusive_chunk_owner(
+    points: torch.Tensor,
+    chunk_origins: torch.Tensor,
+    chunk_size: float,
+    batch_size: int = 131072,
+) -> torch.Tensor:
+    """Index of the unique covering chunk, or -1 outside every chunk cube.
+
+    Cubes are half-open [origin, origin+size). Among covering cubes, select the
+    nearest centre; exact ties select the lower input chunk index. Restricting
+    the nearest-centre search to covering chunks handles gaps and nonuniform
+    layouts without claiming points beyond a chunk's decoded support.
+    """
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape [N,3]")
+    if chunk_origins.ndim != 2 or chunk_origins.shape[1] != 3 or len(chunk_origins) == 0:
+        raise ValueError("chunk_origins must have nonempty shape [K,3]")
+    if chunk_size <= 0 or batch_size <= 0:
+        raise ValueError("chunk_size and batch_size must be positive")
+    origins = chunk_origins.to(device=points.device, dtype=torch.float32)
+    centres = origins + float(chunk_size) * 0.5
+    owners = torch.full((len(points),), -1, device=points.device, dtype=torch.long)
+    for start in range(0, len(points), batch_size):
+        p = points[start : start + batch_size].float()
+        covered = ((p[:, None, :] >= origins[None, :, :]) &
+                   (p[:, None, :] < origins[None, :, :] + float(chunk_size))).all(dim=-1)
+        distances = ((p[:, None, :] - centres[None, :, :]) ** 2).sum(dim=-1)
+        distances.masked_fill_(~covered, float("inf"))
+        distance, owner = distances.min(dim=1)  # torch.min returns first index on exact ties
+        owners[start : start + len(p)] = torch.where(torch.isfinite(distance), owner, -1)
+    return owners
+
+
+def _owned_by_group(
+    points: torch.Tensor,
+    chunk_origins: torch.Tensor,
+    chunk_size: float,
+    group: List[int],
+) -> torch.Tensor:
+    owners = _exclusive_chunk_owner(points, chunk_origins, chunk_size)
+    members = torch.zeros(len(chunk_origins), device=points.device, dtype=torch.bool)
+    members[torch.as_tensor(group, device=points.device, dtype=torch.long)] = True
+    return (owners >= 0) & members[owners.clamp_min(0)]
+
+
+def _filter_sparse_to_owned(
+    st: SparseTensor,
+    chunk_origins: torch.Tensor,
+    R_in: int,
+    upscale: int,
+    group: List[int],
+) -> SparseTensor:
+    # A texture voxel represents its centre, expressed in the same coarse
+    # joint-frame coordinates used for face-centroid ownership.
+    centres = (st.coords[:, 1:].float() + 0.5) / float(upscale)
+    keep = _owned_by_group(centres, chunk_origins, R_in, group)
+    return SparseTensor(feats=st.feats[keep].contiguous(), coords=st.coords[keep].contiguous())
+
+
+def _face_owned_by_group(
+    voxel_coords: torch.Tensor,
+    faces: torch.Tensor,
+    chunk_origins: torch.Tensor,
+    R_in: int,
+    upscale: int,
+    group: List[int],
+) -> torch.Tensor:
+    # Use the fixed lattice barycentre, not the predicted vertex positions.
+    # Separate decoder contexts can perturb one voxel's predicted position to
+    # opposite sides of a seam. Lattice-identical faces must pick one owner
+    # before their vertices are merged, independently of those perturbations.
+    centres = (voxel_coords[faces.long()].float() + 0.5).mean(dim=1) / float(upscale)
+    return _owned_by_group(centres, chunk_origins, R_in, group)
 
 
 def _concat_sparse(parts: List[SparseTensor]) -> SparseTensor:
@@ -324,14 +407,15 @@ def joint_decode_shape(
     # an O(N * 36) intermediate (edge_neighbor_voxel) that exceeds 80 GB at
     # full-scene N. Per-group extraction caps that allocation at per-group
     # voxel count. Each group mesh-extracts on its INFLATED voxel set so
-    # boundary adjacency is intact, then keeps only faces whose centroid is
-    # in the OWNED AABB (faces are claimed by exactly one group; owned AABBs
-    # are spatially disjoint by construction). Boundary mesh vertices appear
+    # boundary adjacency is intact, then keeps each face only in the group
+    # containing its unique owning chunk. Support AABBs overlap and are NOT
+    # an ownership partition. Boundary mesh vertices appear
     # in multiple groups' inflated extracts; we dedupe by voxel coord at the
     # end so the final mesh shares vertices across group boundaries.
     offsets = [(t.to(device) * R_in).round().long() for t in relative_transl]
     mins = torch.stack(offsets).min(dim=0).values
     offsets_minus_mins = [(o - mins) for o in offsets]
+    chunk_origins = torch.stack(offsets_minus_mins)
 
     chunk_cap = max_chunks_per_group if max_chunks_per_group is not None else len(slats)
     groups, group_inflated_counts = _make_groups(
@@ -381,12 +465,10 @@ def joint_decode_shape(
             train=False,
         )
 
-        # Filter faces to those whose centroid lies in owned region (in world).
-        # owned_world = owned_aabb_R_in / R_in + aabb[0].
-        owned_world_min = (owned_aabb[0].float() / R_in + aabb[0]).to(mesh_v_g.dtype)
-        owned_world_max = (owned_aabb[1].float() / R_in + aabb[0]).to(mesh_v_g.dtype)
-        face_centroids = mesh_v_g[mesh_f_g.long()].mean(dim=1)  # [F_g, 3]
-        in_owned = ((face_centroids >= owned_world_min) & (face_centroids < owned_world_max)).all(dim=1)
+        # Shape and texture use fixed fine-voxel centres in the same coarse
+        # joint frame; neural vertex perturbations cannot change ownership.
+        in_owned = _face_owned_by_group(coords_g, mesh_f_g, chunk_origins,
+                                        R_in, upscale, group)
         mesh_f_owned = mesh_f_g[in_owned]
 
         # Compact: keep only vertices referenced by owned faces.
@@ -413,7 +495,7 @@ def joint_decode_shape(
 
         del slat_g, h_g, subs_g, v_g, i_g, q_g, coords_g
         del mesh_v_g, mesh_f_g, mesh_f_owned, used_v, remap
-        del mesh_v_compact, mesh_f_compact, voxel_coords_compact, face_centroids, in_owned
+        del mesh_v_compact, mesh_f_compact, voxel_coords_compact, in_owned
         torch.cuda.empty_cache()
 
     # ── Concat per-group meshes + dedupe boundary vertices ────────────────
@@ -463,6 +545,8 @@ def joint_decode_shape(
         subs_inflated=subs_inflated_per_group,
         R_in=R_in,
         upscale=upscale,
+        chunk_origins=chunk_origins.cpu(),
+        groups=groups,
     )
     return scene_mesh, aabb, grid_size_fine, ctx, meta
 
@@ -492,13 +576,18 @@ def joint_decode_tex(
     # Chunked path: per-group decode with own subs, merge owned outputs.
     # subs were CPU-stashed in joint_decode_shape; lift back to GPU per group.
     device = joint_slat.feats.device
+    if ctx.chunk_origins is None or ctx.groups is None:
+        raise ValueError("Chunked texture decode requires exclusive ownership metadata from shape decode")
+    if len(ctx.groups) != len(ctx.inflated_aabbs):
+        raise ValueError("Shape/texture decode group count differs")
     h_owned_parts: List[SparseTensor] = []
     for g_idx, (inflated, owned, subs_g_cpu) in enumerate(zip(ctx.inflated_aabbs, ctx.owned_aabbs, ctx.subs_inflated)):
         tex_slat_g = _filter_sparse_to_aabb(joint_slat, inflated[0], inflated[1])
         subs_g = [_sparse_to_device_clean(s, device) for s in subs_g_cpu]
         n_in = tex_slat_g.feats.shape[0]
         h_g = decoder(tex_slat_g, guide_subs=subs_g)
-        h_g_owned = _filter_sparse_to_aabb(h_g, owned[0] * ctx.upscale, owned[1] * ctx.upscale)
+        h_g_owned = _filter_sparse_to_owned(h_g, ctx.chunk_origins, ctx.R_in,
+                                             ctx.upscale, ctx.groups[g_idx])
         # CPU-offload like the shape pass to keep GPU clear between groups.
         h_owned_parts.append(_sparse_cpu_clean(h_g_owned))
         print(f"[joint_decode_tex] group {g_idx}: in={n_in:,} → out_owned={h_g_owned.feats.shape[0]:,}")

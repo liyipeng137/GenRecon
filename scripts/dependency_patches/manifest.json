@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "python": "3.12.3",
+  "torch": "2.10.0+cu128",
+  "toolkit_cuda": "12.8",
+  "actual_cgroup_ram_limit_bytes": 61999996928,
+  "packages": {
+    "cumesh": {
+      "repository": "https://github.com/JeffreyXiang/CuMesh",
+      "base_commit": "12289e1062f0603f2f0d0771b02e1395d247f26f",
+      "patch": "cumesh_zero_work.patch",
+      "patch_sha256": "ae765a15644fdaab5ac457214fa1cbe8e7950957dbdd4c1f148198ee7f71ef8c",
+      "rebuild": "rebuild_cumesh.sh",
+      "test": "test_cumesh_zero_work.py",
+      "build_max_jobs": 2,
+      "validation": {
+        "before_cases": 15,
+        "before_reproduced_zero_work_errors": 7,
+        "after_passed_cases": 15,
+        "preserves_input_geometry": true
+      }
+    },
+    "flash_attention": {
+      "repository": "https://github.com/Dao-AILab/flash-attention",
+      "base_commit": "49774b31c8d1172a5b28f72e9aed0f322bf4ccba",
+      "base_tag": "v2.8.3.post2",
+      "installed_version": "2.8.3.post2+infer89",
+      "patch": "flash_inference_only.patch",
+      "patch_sha256": "5b4c9776835d7bb45bf365c637c31c6fbfc2e2843913fc4d2385cbf97802bfac",
+      "rebuild": "rebuild_flash.sh",
+      "compiled_sm": "80 (compatible with Ada sm89)",
+      "forward_head_dims": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256
+      ],
+      "forward_dtypes": [
+        "float16",
+        "bfloat16"
+      ],
+      "unsupported": [
+        "backward/training",
+        "nonzero attention dropout",
+        "ALiBi",
+        "local-window attention",
+        "nonzero softcap"
+      ],
+      "validation": {
+        "dense_and_varlen_head32_bf16_max_error": 0.0,
+        "dense_and_varlen_head128_bf16_max_error": 0.0,
+        "dense_and_varlen_head128_fp16_max_error": 0.000244140625,
+        "reference": "torch SDPA",
+        "peak_cuda_allocated_mib": 0.09423828125
+      }
+    }
+  },
+  "runtime_environment_log": "/kiri/run_logs/genrecon_20261027/environment_manifest.json"
+}

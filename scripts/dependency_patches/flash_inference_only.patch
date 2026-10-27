@@ -1,0 +1,79 @@
+diff --git a/csrc/flash_attn/flash_api.cpp b/csrc/flash_attn/flash_api.cpp
+index dd7a5c3..dfbb91d 100644
+--- a/csrc/flash_attn/flash_api.cpp
++++ b/csrc/flash_attn/flash_api.cpp
+@@ -755,6 +755,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+ }
+ 
+ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
++#ifdef FLASHATTENTION_DISABLE_BACKWARD
++    TORCH_CHECK(false, "This inference-only flash attention build does not support backward.");
++#else
+     FP16_SWITCH(!params.is_bf16, [&] {
+         HEADDIM_SWITCH(params.d, [&] {
+             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+@@ -762,6 +765,7 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+             });
+         });
+     });
++#endif
+ }
+ 
+ std::vector<at::Tensor>
+diff --git a/setup.py b/setup.py
+index d180c18..6c9a40a 100644
+--- a/setup.py
++++ b/setup.py
+@@ -209,15 +209,15 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
+     # "--ptxas-options=-v",
+     # "--ptxas-options=-O2",
+     # "-lineinfo",
+-    # "-DFLASHATTENTION_DISABLE_BACKWARD",
+-    # "-DFLASHATTENTION_DISABLE_DROPOUT",
+-    # "-DFLASHATTENTION_DISABLE_ALIBI",
+-    # "-DFLASHATTENTION_DISABLE_SOFTCAP",
++    "-DFLASHATTENTION_DISABLE_BACKWARD",
++    "-DFLASHATTENTION_DISABLE_DROPOUT",
++    "-DFLASHATTENTION_DISABLE_ALIBI",
++    "-DFLASHATTENTION_DISABLE_SOFTCAP",
+     # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+-    # "-DFLASHATTENTION_DISABLE_LOCAL",
++    "-DFLASHATTENTION_DISABLE_LOCAL",
+     ]
+ 
+-    compiler_c17_flag=["-O3", "-std=c++17"]
++    compiler_c17_flag=['-O3', '-std=c++17', '-DFLASHATTENTION_DISABLE_BACKWARD', '-DFLASHATTENTION_DISABLE_DROPOUT', '-DFLASHATTENTION_DISABLE_ALIBI', '-DFLASHATTENTION_DISABLE_SOFTCAP', '-DFLASHATTENTION_DISABLE_LOCAL']
+     # Add Windows-specific flags
+     if sys.platform == "win32" and os.getenv('DISTUTILS_USE_SDK') == '1':
+         nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
+@@ -252,30 +252,6 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
+                 "csrc/flash_attn/src/flash_fwd_hdim192_bf16_causal_sm80.cu",
+                 "csrc/flash_attn/src/flash_fwd_hdim256_fp16_causal_sm80.cu",
+                 "csrc/flash_attn/src/flash_fwd_hdim256_bf16_causal_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim32_fp16_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim32_bf16_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim64_fp16_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim64_bf16_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim96_fp16_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim96_bf16_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim128_fp16_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim128_bf16_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim192_fp16_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim192_bf16_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim256_fp16_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim32_fp16_causal_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim32_bf16_causal_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim64_fp16_causal_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim64_bf16_causal_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim96_fp16_causal_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim96_bf16_causal_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim128_fp16_causal_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim128_bf16_causal_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim192_fp16_causal_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim192_bf16_causal_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim256_fp16_causal_sm80.cu",
+-                "csrc/flash_attn/src/flash_bwd_hdim256_bf16_causal_sm80.cu",
+                 "csrc/flash_attn/src/flash_fwd_split_hdim32_fp16_sm80.cu",
+                 "csrc/flash_attn/src/flash_fwd_split_hdim32_bf16_sm80.cu",
+                 "csrc/flash_attn/src/flash_fwd_split_hdim64_fp16_sm80.cu",
