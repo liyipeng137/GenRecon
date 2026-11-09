@@ -11,6 +11,7 @@ from PIL import Image
 
 from genrecon.datasets.components import chunk_visible_in_camera
 from genrecon.pipelines.types import SelectedImages
+from inference.get_chunks import colmap_x_rotation_matrix, read_colmap_cameras, read_colmap_images, resolve_colmap_model_file
 from inference.view_selection import chunk_projection_areas, coverage_report, select_pose_coverage
 
 # ScanNet++ Nerfstudio DSLR poses are stored in a world frame that differs from
@@ -526,10 +527,9 @@ class ScannetIphoneMixin:
         Load camera parameters from ScanNet++ iPhone COLMAP files.
 
         Args:
-            camera_params_path: path to <scene>/iphone/colmap/cameras.txt
-                (any file in <scene>/iphone/colmap/ works — the directory is used
-                to locate cameras.txt + images.txt; image files come from
-                <scene>/iphone/rgb/).
+            camera_params_path: path to <scene>/iphone/colmap/cameras.txt or
+                cameras.bin (any file in that directory works). Text is used when
+                both formats exist. Image files come from <scene>/iphone/rgb/.
 
         ScanNet++ iPhone COLMAP runs use the OPENCV (radial+tangential) camera
         model with non-zero distortion. The downstream pipeline assumes pure
@@ -554,10 +554,19 @@ class ScannetIphoneMixin:
                 - "intrinsics"  – (3, 3) normalized pinhole intrinsics, post-undistort (torch.Tensor)
         """
         camera_params_path = Path(camera_params_path)
-        colmap_dir = camera_params_path.parent if camera_params_path.is_file() else camera_params_path
-        cameras_txt = colmap_dir / "cameras.txt"
-        images_txt = colmap_dir / "images.txt"
-        image_root = colmap_dir.parent / "rgb"
+        if camera_params_path.suffix.lower() in {".txt", ".bin"}:
+            colmap_dir = camera_params_path.parent
+        else:
+            colmap_dir = camera_params_path if camera_params_path.is_dir() else camera_params_path.parent
+        cameras_path = resolve_colmap_model_file(colmap_dir, "cameras")
+        images_path = resolve_colmap_model_file(colmap_dir, "images")
+        image_candidates = (
+            colmap_dir.parent / "rgb",
+            colmap_dir.parent / "images",
+            colmap_dir.parent.parent / "images",
+            colmap_dir.parent.parent / "rgb",
+        )
+        image_root = next((path for path in image_candidates if path.is_dir()), image_candidates[0])
         # Cache for undistorted frames. Defaults to <scene>/iphone/rgb_undistorted/
         # but can be redirected (e.g. when the dataset dir is read-only) by setting
         # `self.undistort_cache_dir` on the selecter — frames are namespaced by
@@ -576,106 +585,85 @@ class ScannetIphoneMixin:
                 f"extract frames into {image_root}/ before running this mode."
             )
 
-        # ── Parse cameras.txt → per-camera pinhole K (post-undistort) + remap maps ─
+        # ── Parse cameras.txt/.bin → per-camera pinhole K (post-undistort) + remap maps ─
         cam_table: dict[int, dict] = {}
-        with cameras_txt.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split()
-                cam_id = int(parts[0])
-                model = parts[1]
-                W = int(float(parts[2]))
-                H = int(float(parts[3]))
-                params = [float(x) for x in parts[4:]]
+        for cam_id, (model, W, H, params) in read_colmap_cameras(cameras_path).items():
+            params = params.tolist()
 
-                if model == "PINHOLE":
-                    fx, fy, cx, cy = params[:4]
-                    dist = None
-                elif model == "SIMPLE_PINHOLE":
-                    f_focal, cx, cy = params[:3]
-                    fx = fy = f_focal
-                    dist = None
-                elif model == "OPENCV":
-                    fx, fy, cx, cy, k1, k2, p1, p2 = params[:8]
-                    dist = np.array([k1, k2, p1, p2], dtype=np.float64)
-                elif model == "RADIAL":
-                    f_focal, cx, cy, k1, k2 = params[:5]
-                    fx = fy = f_focal
-                    dist = np.array([k1, k2, 0.0, 0.0], dtype=np.float64)
-                elif model == "SIMPLE_RADIAL":
-                    f_focal, cx, cy, k1 = params[:4]
-                    fx = fy = f_focal
-                    dist = np.array([k1, 0.0, 0.0, 0.0], dtype=np.float64)
-                elif model == "OPENCV_FISHEYE":
-                    raise NotImplementedError(
-                        f"Camera {cam_id} uses OPENCV_FISHEYE; this loader handles only "
-                        f"the OPENCV (radial+tangential) model. Fisheye undistortion needs "
-                        f"cv2.fisheye.undistortImage and is not currently wired up."
-                    )
-                else:
-                    raise ValueError(f"Unsupported COLMAP camera model: {model}")
+            if model == "PINHOLE":
+                fx, fy, cx, cy = params[:4]
+                dist = None
+            elif model == "SIMPLE_PINHOLE":
+                f_focal, cx, cy = params[:3]
+                fx = fy = f_focal
+                dist = None
+            elif model == "OPENCV":
+                fx, fy, cx, cy, k1, k2, p1, p2 = params[:8]
+                dist = np.array([k1, k2, p1, p2], dtype=np.float64)
+            elif model == "RADIAL":
+                f_focal, cx, cy, k1, k2 = params[:5]
+                fx = fy = f_focal
+                dist = np.array([k1, k2, 0.0, 0.0], dtype=np.float64)
+            elif model == "SIMPLE_RADIAL":
+                f_focal, cx, cy, k1 = params[:4]
+                fx = fy = f_focal
+                dist = np.array([k1, 0.0, 0.0, 0.0], dtype=np.float64)
+            elif model == "OPENCV_FISHEYE":
+                raise NotImplementedError(
+                    f"Camera {cam_id} uses OPENCV_FISHEYE; this loader handles only "
+                    f"the OPENCV (radial+tangential) model. Fisheye undistortion needs "
+                    f"cv2.fisheye.undistortImage and is not currently wired up."
+                )
+            else:
+                raise ValueError(f"Unsupported COLMAP camera model: {model}")
 
-                K_pix = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+            K_pix = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
 
-                if dist is None or not np.any(dist):
-                    cam_table[cam_id] = {
-                        "needs_undistort": False,
-                        "W": W,
-                        "H": H,
-                        "K": K_pix,
-                    }
-                    continue
-
-                # Pinhole K that maximises valid-pixel coverage of the undistorted output.
-                new_K, roi = cv2.getOptimalNewCameraMatrix(K_pix, dist, (W, H), alpha=0, newImgSize=(W, H))
-                x, y, w, h = roi
-                if w <= 0 or h <= 0:
-                    raise RuntimeError(
-                        f"Empty undistortion ROI for camera {cam_id} " f"(W={W}, H={H}, dist={dist.tolist()})."
-                    )
-                # Precompute the per-pixel remap once; reuse for every frame from this camera.
-                mapx, mapy = cv2.initUndistortRectifyMap(K_pix, dist, None, new_K, (W, H), cv2.CV_16SC2)
-                # Shift principal point so the cropped output is consistent with `new_K`.
-                K_cropped = new_K.copy()
-                K_cropped[0, 2] -= x
-                K_cropped[1, 2] -= y
+            if dist is None or not np.any(dist):
                 cam_table[cam_id] = {
-                    "needs_undistort": True,
-                    "W": int(w),
-                    "H": int(h),
-                    "K": K_cropped,
-                    "roi": (int(x), int(y), int(w), int(h)),
-                    "mapx": mapx,
-                    "mapy": mapy,
+                    "needs_undistort": False,
+                    "W": W,
+                    "H": H,
+                    "K": K_pix,
                 }
+                continue
+
+            # Pinhole K that maximises valid-pixel coverage of the undistorted output.
+            new_K, roi = cv2.getOptimalNewCameraMatrix(K_pix, dist, (W, H), alpha=0, newImgSize=(W, H))
+            x, y, w, h = roi
+            if w <= 0 or h <= 0:
+                raise RuntimeError(
+                    f"Empty undistortion ROI for camera {cam_id} " f"(W={W}, H={H}, dist={dist.tolist()})."
+                )
+            # Precompute the per-pixel remap once; reuse for every frame from this camera.
+            mapx, mapy = cv2.initUndistortRectifyMap(K_pix, dist, None, new_K, (W, H), cv2.CV_16SC2)
+            # Shift principal point so the cropped output is consistent with `new_K`.
+            K_cropped = new_K.copy()
+            K_cropped[0, 2] -= x
+            K_cropped[1, 2] -= y
+            cam_table[cam_id] = {
+                "needs_undistort": True,
+                "W": int(w),
+                "H": int(h),
+                "K": K_cropped,
+                "roi": (int(x), int(y), int(w), int(h)),
+                "mapx": mapx,
+                "mapy": mapy,
+            }
 
         if any(c["needs_undistort"] for c in cam_table.values()):
             image_root_undist.mkdir(exist_ok=True)
 
-        # ── Parse images.txt: 2 lines per image (header + POINTS2D); we only need the header ─
+        # ── Parse images.txt/.bin. 2D tracks are not used. ─
         cameras: list[dict] = []
-        with images_txt.open("r", encoding="utf-8") as f:
-            lines = f.readlines()
-        i = 0
         n_undistorted_now = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            if not line or line.startswith("#"):
-                i += 1
-                continue
-            # NAME may contain spaces (e.g. iCloud "IMG_1907 2.png"), so cap split
-            # at 9 so parts[9] keeps the full filename.
-            parts = line.split(maxsplit=9)
-            # IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
-            qw, qx, qy, qz = (float(x) for x in parts[1:5])
-            tx, ty, tz = (float(x) for x in parts[5:8])
-            cam_id = int(parts[8])
+        for qvec, tvec, cam_id, name in read_colmap_images(images_path):
+            qw, qx, qy, qz = (float(x) for x in qvec)
+            tx, ty, tz = (float(x) for x in tvec)
             # Some ScanNet++ scenes encode NAME as "video/frame_xxx.jpg" while the
             # actual extracted RGB lives flat in iphone/rgb/; take the basename
             # so both layouts resolve correctly.
-            name = Path(parts[9]).name
+            name = Path(name).name
 
             cam = cam_table[cam_id]
             if cam["needs_undistort"]:
@@ -719,6 +707,11 @@ class ScannetIphoneMixin:
             w2c[:3, :3] = R_w2c
             w2c[:3, 3] = torch.tensor([tx, ty, tz], dtype=torch.float32)
             c2w_opencv = torch.linalg.inv(w2c)
+            x_rotation = int(getattr(self, "colmap_x_rotation", 0) or 0)
+            if x_rotation:
+                world_rotation = torch.eye(4, dtype=torch.float32)
+                world_rotation[:3, :3] = torch.tensor(colmap_x_rotation_matrix(x_rotation), dtype=torch.float32)
+                c2w_opencv = world_rotation @ c2w_opencv
             c2w_blender = c2w_opencv @ _FLIP_Y_Z
 
             cameras.append(
@@ -728,9 +721,6 @@ class ScannetIphoneMixin:
                     "intrinsics": intrinsics,
                 }
             )
-
-            # Skip the POINTS2D line that follows each image header.
-            i += 2
 
         n_total = len(cameras)
         n_cached = n_total - n_undistorted_now
@@ -842,12 +832,14 @@ class IphoneMixin(ScannetIphoneMixin):
 
 
 class IphoneImageSelecter(_IphoneSelecterMixin, BaseImageSelecter, IphoneMixin):
-    def __init__(self, center_crop: bool = False, **selection_kwargs):
+    def __init__(self, center_crop: bool = False, colmap_x_rotation: int = 0, **selection_kwargs):
         """
         Args:
             center_crop: if True, fall back to the legacy single-square crop
                 around the principal point. Default False → produce two square
                 crops along the longer axis for non-square frames.
+            colmap_x_rotation: 0, 90, or -90. Rotates COLMAP world poses about +X.
         """
         super().__init__(**selection_kwargs)
         self.center_crop = center_crop
+        self.colmap_x_rotation = colmap_x_rotation

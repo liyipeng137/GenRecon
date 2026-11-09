@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import struct
 from pathlib import Path
 from typing import *
 
@@ -10,6 +11,163 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import trimesh
+
+# COLMAP model ids. Binary layout matches the reader in
+# Geometry-Grounded-Gaussian-Splatting/utils/colmap_read_model.py.
+_COLMAP_CAMERA_MODELS = {
+    0: ("SIMPLE_PINHOLE", 3),
+    1: ("PINHOLE", 4),
+    2: ("SIMPLE_RADIAL", 4),
+    3: ("RADIAL", 5),
+    4: ("OPENCV", 8),
+    5: ("OPENCV_FISHEYE", 8),
+    6: ("FULL_OPENCV", 12),
+    7: ("FOV", 5),
+    8: ("SIMPLE_RADIAL_FISHEYE", 4),
+    9: ("RADIAL_FISHEYE", 5),
+    10: ("THIN_PRISM_FISHEYE", 12),
+}
+
+
+def colmap_x_rotation_matrix(degrees: int) -> np.ndarray:
+    """Right-handed rotation about +X. ``+90`` maps +Y to +Z and +Z to -Y."""
+    if degrees == 0:
+        return np.eye(3, dtype=np.float64)
+    if degrees == 90:
+        return np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+    if degrees == -90:
+        return np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]], dtype=np.float64)
+    raise ValueError(f"colmap_x_rotation must be 0, 90, or -90, got {degrees}")
+
+
+def resolve_colmap_model_file(directory: Path | str, stem: str) -> Path:
+    """Return ``stem.txt`` if it exists, otherwise ``stem.bin`` in the same directory."""
+    directory = Path(directory)
+    if directory.suffix.lower() in {".txt", ".bin"}:
+        directory = directory.parent
+    text = directory / f"{stem}.txt"
+    binary = directory / f"{stem}.bin"
+    if text.is_file():
+        return text
+    if binary.is_file():
+        return binary
+    raise FileNotFoundError(f"COLMAP {stem}.txt or {stem}.bin not found in {directory}")
+
+
+def _read_colmap_bytes(fid, num_bytes: int, fmt: str):
+    data = fid.read(num_bytes)
+    if len(data) != num_bytes:
+        raise EOFError(f"Truncated COLMAP binary record, expected {num_bytes} bytes")
+    return struct.unpack("<" + fmt, data)
+
+
+def read_colmap_cameras(path: Path | str) -> dict[int, tuple[str, int, int, np.ndarray]]:
+    """Read cameras.txt or cameras.bin. Values are ``(model, width, height, params)``."""
+    path = Path(path)
+    cameras: dict[int, tuple[str, int, int, np.ndarray]] = {}
+    if path.suffix.lower() == ".txt":
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                cameras[int(parts[0])] = (
+                    parts[1],
+                    int(float(parts[2])),
+                    int(float(parts[3])),
+                    np.asarray(parts[4:], dtype=np.float64),
+                )
+        return cameras
+    with path.open("rb") as handle:
+        count = _read_colmap_bytes(handle, 8, "Q")[0]
+        for _ in range(count):
+            camera_id, model_id, width, height = _read_colmap_bytes(handle, 24, "iiQQ")
+            model, num_params = _COLMAP_CAMERA_MODELS[model_id]
+            params = np.asarray(_read_colmap_bytes(handle, 8 * num_params, "d" * num_params), dtype=np.float64)
+            cameras[int(camera_id)] = (model, int(width), int(height), params)
+    return cameras
+
+
+def read_colmap_images(path: Path | str) -> list[tuple[np.ndarray, np.ndarray, int, str]]:
+    """Read image poses from images.txt or images.bin. 2D tracks are skipped."""
+    path = Path(path)
+    images: list[tuple[np.ndarray, np.ndarray, int, str]] = []
+    if path.suffix.lower() == ".txt":
+        with path.open("r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+        index = 0
+        while index < len(lines):
+            line = lines[index].strip()
+            if not line or line.startswith("#"):
+                index += 1
+                continue
+            parts = line.split(maxsplit=9)
+            images.append(
+                (
+                    np.asarray(parts[1:5], dtype=np.float64),
+                    np.asarray(parts[5:8], dtype=np.float64),
+                    int(parts[8]),
+                    Path(parts[9]).name,
+                )
+            )
+            index += 2
+        return images
+    with path.open("rb") as handle:
+        count = _read_colmap_bytes(handle, 8, "Q")[0]
+        for _ in range(count):
+            props = _read_colmap_bytes(handle, 64, "idddddddi")
+            name = bytearray()
+            char = handle.read(1)
+            while char and char != b"\x00":
+                name.extend(char)
+                char = handle.read(1)
+            num_points = _read_colmap_bytes(handle, 8, "Q")[0]
+            handle.seek(24 * num_points, 1)
+            images.append(
+                (
+                    np.asarray(props[1:5], dtype=np.float64),
+                    np.asarray(props[5:8], dtype=np.float64),
+                    int(props[8]),
+                    name.decode("utf-8"),
+                )
+            )
+    return images
+
+
+def read_colmap_points3d(path: Path | str) -> list[tuple[np.ndarray, float, int]]:
+    """Read points3D.txt or points3D.bin as ``(xyz, reprojection_error, track_length)``."""
+    path = Path(path)
+    points: list[tuple[np.ndarray, float, int]] = []
+    if path.suffix.lower() == ".txt":
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                points.append(
+                    (
+                        np.asarray(parts[1:4], dtype=np.float64),
+                        float(parts[7]),
+                        (len(parts) - 8) // 2,
+                    )
+                )
+        return points
+    with path.open("rb") as handle:
+        count = _read_colmap_bytes(handle, 8, "Q")[0]
+        for _ in range(count):
+            props = _read_colmap_bytes(handle, 43, "QdddBBBd")
+            track_length = _read_colmap_bytes(handle, 8, "Q")[0]
+            handle.seek(8 * track_length, 1)
+            points.append(
+                (
+                    np.asarray(props[1:4], dtype=np.float64),
+                    float(props[7]),
+                    int(track_length),
+                )
+            )
+    return points
 
 
 class BaseChunker:
@@ -300,10 +458,10 @@ class ScannetMixin:
     default_min_track_len: int = 4
 
     def _points3d_path(self, path: str | Path) -> Path:
-        """Path to the COLMAP points3D.txt for this mode. Subclasses with a
+        """Path to COLMAP points3D.txt or points3D.bin. Subclasses with a
         different layout (e.g. MASt3R-SfM under <scene>/colmap_mast3r/)
         override this."""
-        return Path(path) / self.colmap_subdir / "colmap" / "points3D.txt"
+        return resolve_colmap_model_file(Path(path) / self.colmap_subdir / "colmap", "points3D")
 
     def _get_clean_points(
         self,
@@ -318,13 +476,11 @@ class ScannetMixin:
     ) -> np.ndarray:
         """Load the scene's COLMAP sparse point cloud and strip outliers.
 
-        Reads <path>/<colmap_subdir>/colmap/points3D.txt, drops points whose reprojection error
+        Reads points3D.txt or points3D.bin, drops points whose reprojection error
         exceeds max_reproj_error or whose track length is below min_track_len (window
         reflections typically fail both), then applies statistical + radius outlier
         removal. Saves the cleaned cloud as <out_path>/clean_points.ply and returns
         a (N, 3) float array.
-
-        points3D.txt row format: ID X Y Z R G B ERROR TRACK[(IMG_ID, PT2D_IDX), ...]
         """
         import open3d as o3d
 
@@ -333,20 +489,25 @@ class ScannetMixin:
         if min_track_len is None:
             min_track_len = self.default_min_track_len
 
-        pts_path = self._points3d_path(path)
-        xyz: list[list[float]] = []
-        with pts_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split()
-                error = float(parts[7])
-                track_len = (len(parts) - 8) // 2
-                if error > max_reproj_error or track_len < min_track_len:
-                    continue
-                xyz.append([float(parts[1]), float(parts[2]), float(parts[3])])
-        points = np.asarray(xyz, dtype=np.float64)
+        init_ply = getattr(self, "init_points_ply", None)
+        if init_ply:
+            loaded = trimesh.load(init_ply, process=False)
+            points = np.asarray(loaded.vertices, dtype=np.float64)
+            if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+                raise ValueError(f"init point cloud has no xyz vertices: {init_ply}")
+            print(f"[chunks] using external point cloud {init_ply} ({len(points)} pts)")
+        else:
+            points_iter = (
+                xyz for xyz, error, track_len in read_colmap_points3d(self._points3d_path(path))
+                if error <= max_reproj_error and track_len >= min_track_len
+            )
+            points = np.asarray(list(points_iter), dtype=np.float64)
+            if points.size == 0:
+                points = np.zeros((0, 3), dtype=np.float64)
+        x_rotation = int(getattr(self, "colmap_x_rotation", 0) or 0)
+        if x_rotation:
+            points = points @ colmap_x_rotation_matrix(x_rotation).T
+            print(f"[COLMAP] rotated point cloud by x {x_rotation:+d} deg")
         print(f"\n Initial number of points: {len(points)}")
 
         pcd = o3d.geometry.PointCloud()
@@ -551,12 +712,12 @@ class IphoneMixin(ScannetIphoneMixin):
     track-length filter at 0 and lift the reprojection-error filter.
     """
 
-    colmap_subdir: str = "colmap_mast3r"
+    colmap_subdir: str = "sparse/0"
     default_min_track_len: int = 0
     default_max_reproj_error: float = float("inf")
 
     def _points3d_path(self, path: str | Path) -> Path:
-        return Path(path) / self.colmap_subdir / "points3D.txt"
+        return resolve_colmap_model_file(Path(path) / self.colmap_subdir, "points3D")
 
 
 class IphoneChunker(BaseChunker, IphoneMixin):
@@ -564,7 +725,9 @@ class IphoneChunker(BaseChunker, IphoneMixin):
         self,
         min_overlap_factor: int = 4,
         chunk_size_factor: float = 1.08,
-        colmap_subdir: str = "colmap_mast3r",
+        colmap_subdir: str = "sparse/0",
+        colmap_x_rotation: int = 0,
+        init_points_ply: str | None = None,
         stat_std_ratio: float | None = None,
         radius_nb_points: int | None = None,
         radius_m: float | None = None,
@@ -575,6 +738,8 @@ class IphoneChunker(BaseChunker, IphoneMixin):
         super().__init__(min_overlap_factor=min_overlap_factor)
         self.chunk_size_factor = chunk_size_factor
         self.colmap_subdir = colmap_subdir
+        self.colmap_x_rotation = colmap_x_rotation
+        self.init_points_ply = init_points_ply
         self.stat_std_ratio = stat_std_ratio
         self.radius_nb_points = radius_nb_points
         self.radius_m = radius_m

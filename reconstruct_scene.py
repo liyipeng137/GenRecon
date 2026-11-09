@@ -33,6 +33,7 @@ from inference.get_chunks import (
     ScannetChunker,
     ScannetGtChunker,
     ScannetIphoneChunker,
+    colmap_x_rotation_matrix,
 )
 from inference.get_images import (
     IphoneImageSelecter,
@@ -94,7 +95,7 @@ MODES = {
     "Iphone": (
         IphoneChunker,
         IphoneImageSelecter,
-        lambda p: p / "colmap" / "cameras.txt",
+        lambda p: p / "sparse" / "0" / "cameras.txt",
     ),
 }
 
@@ -184,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
         "Defaults to ImagesTo3DPipeline.DEFAULT_PIPELINE_CONFIG_FILE "
         "(configs/pipelines/original.json).",
     )
-    parser.add_argument("--num_imgs_per_scene", type=int, default=32)
+    parser.add_argument("--num_imgs_per_scene", type=int, default=250)
     parser.add_argument("--view_selection", choices=["pose_coverage", "uniform"], default="pose_coverage",
                         help="Original-image selection: pose deduplication with chunk-frustum coverage, "
                              "or legacy evenly spaced indices.")
@@ -246,10 +247,27 @@ def build_parser() -> argparse.ArgumentParser:
         "(additive chunk_size); passing it explicitly there is an error.",
     )
     parser.add_argument(
+        "--colmap_x_rotation",
+        type=int,
+        choices=(0, 90, -90),
+        default=0,
+        help="Iphone mode only. Rotate loaded points and camera poses about +X "
+        "by 90 or -90 degrees (right-hand rule) before chunking. Applies to COLMAP "
+        "points, --init_points_ply, and camera poses. mesh.ply is rotated back so it "
+        "stays in the original COLMAP frame. 0 leaves them unchanged.",
+    )
+    parser.add_argument(
+        "--init_points_ply",
+        default=None,
+        help="Iphone mode only. XYZ point cloud in the COLMAP frame, used instead of "
+        "points3D for chunking. --colmap_x_rotation is applied to it.",
+    )
+    parser.add_argument(
         "--colmap_subdir",
-        default="colmap",
-        help="Subdirectory under --path holding cameras.txt/images.txt/points3D.txt "
-        "for mode=Iphone (e.g. colmap_mast3r, colmap_hloc). Ignored for other modes.",
+        default="sparse/0",
+        help="Subdirectory under --path holding cameras/images/points3D as .txt or .bin "
+        "for mode=Iphone. Default is sparse/0. Text wins when both exist. "
+        "Ignored for other modes.",
     )
     parser.add_argument(
         "--min_points_per_chunk",
@@ -382,8 +400,15 @@ def main() -> None:
             parser.error("--chunk_size_factor is not supported for mode=Sage_gt (additive chunk_size).")
     elif args.chunk_size_factor is not None:
         chunker_kwargs["chunk_size_factor"] = args.chunk_size_factor
+    if args.colmap_x_rotation and args.mode != "Iphone":
+        parser.error("--colmap_x_rotation is only supported for mode=Iphone.")
+    if args.init_points_ply and args.mode != "Iphone":
+        parser.error("--init_points_ply is only supported for mode=Iphone.")
     if args.mode == "Iphone":
         chunker_kwargs["colmap_subdir"] = args.colmap_subdir
+        chunker_kwargs["colmap_x_rotation"] = args.colmap_x_rotation
+        if args.init_points_ply:
+            chunker_kwargs["init_points_ply"] = args.init_points_ply
         if args.stat_std_ratio is not None:
             chunker_kwargs["stat_std_ratio"] = args.stat_std_ratio
         if args.radius_nb_points is not None:
@@ -417,6 +442,8 @@ def main() -> None:
                                 min_views_per_chunk=args.min_views_per_chunk)
     if args.mode in ("Scannet_iphone", "Iphone"):
         selecter_kwargs["center_crop"] = args.center_crop
+    if args.mode == "Iphone":
+        selecter_kwargs["colmap_x_rotation"] = args.colmap_x_rotation
     sel = selecter_cls(**selecter_kwargs).get_images(
         m_o2c,
         transforms_json(scene_path),
@@ -514,15 +541,26 @@ def main() -> None:
         print(f"[chunked] saved chunk metadata to {out_path / 'chunk_inputs.pt'}")
     else:
         # Joint frame = chunker's chunk-0 local frame, so m_c2o[0] lifts it to world.
+        # That world is the rotated COLMAP frame. Undo the rotation on mesh.ply only.
         chunk_size = m_c2o[0][0, 0].item()
         chunk_center0 = m_c2o[0][:3, 3].to(scene_mesh.vertices.device, dtype=scene_mesh.vertices.dtype)
+        mesh_transform = m_c2o[0]
+        if args.colmap_x_rotation:
+            undo = torch.eye(4, dtype=mesh_transform.dtype, device=mesh_transform.device)
+            undo[:3, :3] = torch.as_tensor(
+                colmap_x_rotation_matrix(args.colmap_x_rotation).T,
+                dtype=mesh_transform.dtype,
+                device=mesh_transform.device,
+            )
+            mesh_transform = undo @ mesh_transform
+            print(f"[mesh] inverse x rotation {-args.colmap_x_rotation:+d} deg applied to mesh.ply")
         _save_plys(
             out_path,
             scene_mesh,
             coords_list,
             coords_resolution,
             sel.chunk_indices,
-            mesh_transform=m_c2o[0],
+            mesh_transform=mesh_transform,
             coords_transform=lambda i: m_c2o[i],
             label="\n PLY saved!",
         )
@@ -549,3 +587,18 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# python reconstruct_scene.py   \
+# --mode Iphone  \
+# --path /workspace/dataset/245_for_train  \
+# --output_path /workspace/GenRecon/output/245_x90  \
+# --ss_ckpt /workspace/GenRecon/checkpoints/sparse_structure.pt  \
+# --shape_ckpt /workspace/GenRecon/checkpoints/shape_slat.pt  \
+# --tex_ckpt /workspace/GenRecon/checkpoints/texture_slat.pt  \
+# --pipeline 512  \
+# --pipeline_config configs/pipelines/texture.json  \
+# --skip_point_cleaning  \
+# --min_points_per_chunk 100  \
+# --proj_batch_voxels 2048  \
+# --colmap_x_rotation 90  \
+# --init_points_ply /workspace/dataset/245_for_train/rgbd_init_train_c500557fde7352fb.ply

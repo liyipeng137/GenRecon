@@ -209,3 +209,5 @@ __marimo__/
 # Results
 *.jpg
 /visualization
+checkpoints/
+output/
